@@ -88,6 +88,7 @@ interface ToolInFlight {
   readonly toolName: string;
   readonly title: string;
   readonly detail?: string;
+  inputJsonChunks: string[];
 }
 
 interface ClaudeSessionContext {
@@ -248,10 +249,26 @@ function summarizeToolRequest(toolName: string, input: Record<string, unknown>):
   }
 
   const serialized = JSON.stringify(input);
+  if (serialized === "{}" || serialized === "null") {
+    return toolName;
+  }
   if (serialized.length <= 400) {
     return `${toolName}: ${serialized}`;
   }
   return `${toolName}: ${serialized.slice(0, 397)}...`;
+}
+
+function recalculateToolDetail(tool: ToolInFlight): string | undefined {
+  if (tool.inputJsonChunks.length === 0) {
+    return tool.detail;
+  }
+  const rawJson = tool.inputJsonChunks.join("");
+  try {
+    const parsedInput = JSON.parse(rawJson) as Record<string, unknown>;
+    return summarizeToolRequest(tool.toolName, parsedInput);
+  } catch {
+    return `${tool.toolName}: ${rawJson.slice(0, 400)}`;
+  }
 }
 
 function titleForTool(itemType: CanonicalItemType): string {
@@ -783,6 +800,14 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
         const { event } = message;
 
         if (event.type === "content_block_delta") {
+          if (event.delta.type === "input_json_delta") {
+            const tool = context.inFlightTools.get(event.index);
+            if (tool && typeof event.delta.partial_json === "string") {
+              tool.inputJsonChunks.push(event.delta.partial_json);
+            }
+            return;
+          }
+
           if (
             event.delta.type === "text_delta" &&
             event.delta.text.length > 0 &&
@@ -847,6 +872,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
             toolName,
             title: titleForTool(itemType),
             detail,
+            inputJsonChunks: [],
           };
           context.inFlightTools.set(index, tool);
 
@@ -891,6 +917,9 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           }
           context.inFlightTools.delete(index);
 
+          // Recalculate detail from accumulated input JSON deltas
+          const finalDetail = recalculateToolDetail(tool);
+
           const stamp = yield* makeEventStamp();
           yield* offerRuntimeEvent({
             type: "item.completed",
@@ -904,7 +933,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
               itemType: tool.itemType,
               status: "completed",
               title: tool.title,
-              ...(tool.detail ? { detail: tool.detail } : {}),
+              ...(finalDetail ? { detail: finalDetail } : {}),
             },
             providerRefs: {
               ...providerThreadRef(context),
