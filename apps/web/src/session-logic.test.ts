@@ -677,19 +677,17 @@ describe("PROVIDER_OPTIONS", () => {
     const claude = PROVIDER_OPTIONS.find((option) => option.value === "claudeCode");
     const cursor = PROVIDER_OPTIONS.find((option) => option.value === "cursor");
     expect(PROVIDER_OPTIONS).toEqual([
-      { value: "codex", label: "Codex", available: true },
-      { value: "claudeCode", label: "Claude Code", available: true },
-      { value: "cursor", label: "Cursor", available: false },
+      { value: "codex", label: "Codex" },
+      { value: "claudeCode", label: "Claude Code" },
+      { value: "cursor", label: "Cursor" },
     ]);
     expect(claude).toEqual({
       value: "claudeCode",
       label: "Claude Code",
-      available: true,
     });
     expect(cursor).toEqual({
       value: "cursor",
       label: "Cursor",
-      available: false,
     });
   });
 });
