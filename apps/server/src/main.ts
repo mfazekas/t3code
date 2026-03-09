@@ -263,14 +263,16 @@ const makeServerProgram = (input: CliInput) =>
         ? `http://${formatHostForUrl(config.host)}:${config.port}`
         : localUrl;
     const { authToken, devUrl, ...safeConfig } = config;
+    const authUrl = authToken ? `${localUrl}/?token=${authToken}` : null;
     yield* Effect.logInfo("T3 Code running", {
       ...safeConfig,
       devUrl: devUrl?.toString(),
       authEnabled: Boolean(authToken),
+      ...(authUrl ? { authUrl } : {}),
     });
 
     if (!config.noBrowser) {
-      const target = config.devUrl?.toString() ?? bindUrl;
+      const target = config.devUrl?.toString() ?? (authUrl ?? bindUrl);
       yield* openDeps.openBrowser(target).pipe(
         Effect.catch(() =>
           Effect.logInfo("browser auto-open unavailable", {

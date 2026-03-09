@@ -62,13 +62,19 @@ export class WsTransport {
   constructor(url?: string) {
     const bridgeUrl = window.desktopBridge?.getWsUrl();
     const envUrl = import.meta.env.VITE_WS_URL as string | undefined;
-    this.url =
+    const baseUrl =
       url ??
       (bridgeUrl && bridgeUrl.length > 0
         ? bridgeUrl
         : envUrl && envUrl.length > 0
           ? envUrl
           : `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:${window.location.port}`);
+    const pageToken = new URLSearchParams(window.location.search).get("token");
+    if (pageToken) {
+      localStorage.setItem("authToken", pageToken);
+    }
+    const token = pageToken ?? localStorage.getItem("authToken");
+    this.url = token ? `${baseUrl}?token=${encodeURIComponent(token)}` : baseUrl;
     this.connect();
   }
 
