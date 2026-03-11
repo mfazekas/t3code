@@ -106,7 +106,6 @@ export interface CursorModelSelection {
   readonly thinking: boolean;
 }
 
-
 export function getModelOptions(provider: ProviderKind = "codex") {
   return MODEL_OPTIONS_BY_PROVIDER[provider];
 }

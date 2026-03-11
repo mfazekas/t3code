@@ -89,7 +89,6 @@ describe("resolvePlanFollowUpSubmission", () => {
   });
 });
 
-
 describe("buildPlanImplementationThreadTitle", () => {
   it("uses the plan heading when building the implementation thread title", () => {
     expect(buildPlanImplementationThreadTitle("# Integrate RPC\n\nBody")).toBe(

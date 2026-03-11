@@ -272,7 +272,7 @@ const makeServerProgram = (input: CliInput) =>
     });
 
     if (!config.noBrowser) {
-      const target = config.devUrl?.toString() ?? (authUrl ?? bindUrl);
+      const target = config.devUrl?.toString() ?? authUrl ?? bindUrl;
       yield* openDeps.openBrowser(target).pipe(
         Effect.catch(() =>
           Effect.logInfo("browser auto-open unavailable", {

@@ -116,7 +116,10 @@ export function formatElapsed(startIso: string, endIso: string | undefined): str
   return formatDuration(endedAt - startedAt);
 }
 
-type LatestTurnTiming = Pick<OrchestrationLatestTurn, "turnId" | "startedAt" | "completedAt" | "state">;
+type LatestTurnTiming = Pick<
+  OrchestrationLatestTurn,
+  "turnId" | "startedAt" | "completedAt" | "state"
+>;
 type SessionActivityState = Pick<ThreadSession, "orchestrationStatus" | "activeTurnId">;
 
 export function isLatestTurnSettled(
@@ -605,7 +608,6 @@ function extractChangedFiles(payload: Record<string, unknown> | null): string[] 
   collectChangedFiles(asRecord(payload?.data), changedFiles, seen, 0);
   return changedFiles;
 }
-
 
 function compareActivitiesByOrder(
   left: OrchestrationThreadActivity,

@@ -189,11 +189,13 @@ const makeClaudeCodeTextGeneration = Effect.gen(function* () {
         },
       );
 
-      const child = yield* commandSpawner.spawn(command).pipe(
-        Effect.mapError((cause) =>
-          normalizeClaudeError(operation, cause, "Failed to spawn Claude CLI process"),
-        ),
-      );
+      const child = yield* commandSpawner
+        .spawn(command)
+        .pipe(
+          Effect.mapError((cause) =>
+            normalizeClaudeError(operation, cause, "Failed to spawn Claude CLI process"),
+          ),
+        );
 
       const [stdout, stderr, exitCode] = yield* Effect.all(
         [

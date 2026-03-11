@@ -187,6 +187,7 @@ export const OrchestrationSession = Schema.Struct({
   activeTurnId: Schema.NullOr(TurnId),
   lastError: Schema.NullOr(TrimmedNonEmptyString),
   updatedAt: IsoDateTime,
+  providerThreadId: Schema.optional(TrimmedNonEmptyString),
 });
 export type OrchestrationSession = typeof OrchestrationSession.Type;
 

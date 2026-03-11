@@ -112,4 +112,5 @@ export interface ThreadSession {
   updatedAt: string;
   lastError?: string;
   orchestrationStatus: OrchestrationSessionStatus;
+  providerThreadId?: string | undefined;
 }

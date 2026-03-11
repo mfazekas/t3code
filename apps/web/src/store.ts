@@ -306,6 +306,9 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
               createdAt: thread.session.updatedAt,
               updatedAt: thread.session.updatedAt,
               ...(thread.session.lastError ? { lastError: thread.session.lastError } : {}),
+              ...(thread.session.providerThreadId
+                ? { providerThreadId: thread.session.providerThreadId }
+                : {}),
             }
           : null,
         messages: thread.messages.map((message) => {

@@ -854,6 +854,8 @@ const make = Effect.gen(function* () {
                 : (thread.session?.lastError ?? null);
 
         if (shouldApplyThreadLifecycle) {
+          const incomingProviderThreadId =
+            event.type === "thread.started" ? event.payload.providerThreadId : undefined;
           yield* orchestrationEngine.dispatch({
             type: "thread.session.set",
             commandId: providerCommandId(event, "thread-session-set"),
@@ -866,6 +868,11 @@ const make = Effect.gen(function* () {
               activeTurnId: nextActiveTurnId,
               lastError,
               updatedAt: now,
+              ...(incomingProviderThreadId
+                ? { providerThreadId: incomingProviderThreadId }
+                : thread.session?.providerThreadId
+                  ? { providerThreadId: thread.session.providerThreadId }
+                  : {}),
             },
             createdAt: now,
           });
