@@ -1015,6 +1015,14 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
         const status = turnStatusFromResult(message);
         const errorMessage = message.subtype === "success" ? undefined : message.errors[0];
 
+        yield* Effect.log(`Turn result: ${status}`).pipe(
+          Effect.annotateLogs({
+            threadId: String(context.session.threadId ?? context.lookupKey),
+            status,
+            ...(errorMessage ? { error: errorMessage } : {}),
+          }),
+        );
+
         if (status === "failed") {
           yield* emitRuntimeError(context, errorMessage ?? "Claude turn failed.");
         }
@@ -1302,20 +1310,25 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
       });
 
     const runSdkStream = (context: ClaudeSessionContext): Effect.Effect<void> =>
-      Stream.fromAsyncIterable(context.query, (cause) => cause).pipe(
-        Stream.takeWhile(() => !context.stopped),
-        Stream.runForEach((message) => handleSdkMessage(context, message)),
-        Effect.catchCause((cause) =>
-          Effect.gen(function* () {
-            if (Cause.hasInterruptsOnly(cause) || context.stopped) {
-              return;
-            }
-            const message = toMessage(Cause.squash(cause), "Claude runtime stream failed.");
-            yield* emitRuntimeError(context, message, cause);
-            yield* completeTurn(context, "failed", message);
-          }),
-        ),
-      );
+      Effect.gen(function* () {
+        yield* Effect.log("SDK stream starting");
+        yield* Stream.fromAsyncIterable(context.query, (cause) => cause).pipe(
+          Stream.takeWhile(() => !context.stopped),
+          Stream.runForEach((message) => handleSdkMessage(context, message)),
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              if (Cause.hasInterruptsOnly(cause) || context.stopped) {
+                return;
+              }
+              const message = toMessage(Cause.squash(cause), "Claude runtime stream failed.");
+              yield* Effect.logError("SDK stream failed", { error: message });
+              yield* emitRuntimeError(context, message, cause);
+              yield* completeTurn(context, "failed", message);
+            }),
+          ),
+        );
+        yield* Effect.log("SDK stream ended");
+      }).pipe(Effect.annotateLogs({ threadId: String(context.lookupKey) }));
 
     const stopSessionInternal = (
       context: ClaudeSessionContext,
@@ -1325,6 +1338,10 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
         if (context.stopped) return;
 
         context.stopped = true;
+
+        yield* Effect.log("Session stopped").pipe(
+          Effect.annotateLogs({ threadId: String(context.lookupKey) }),
+        );
 
         for (const [requestId, pending] of context.pendingApprovals) {
           yield* Deferred.succeed(pending.decision, "cancel");
@@ -1643,6 +1660,16 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
         };
         yield* Ref.set(contextRef, context);
         sessions.set(threadId, context);
+
+        yield* Effect.log("Session started").pipe(
+          Effect.annotateLogs({
+            threadId: String(threadId),
+            model: input.model ?? "default",
+            runtimeMode: input.runtimeMode ?? "full-access",
+            ...(input.cwd ? { cwd: input.cwd } : {}),
+          }),
+        );
+
 
         const sessionStartedStamp = yield* makeEventStamp();
         yield* offerRuntimeEvent({
