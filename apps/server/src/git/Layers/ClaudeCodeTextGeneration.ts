@@ -5,7 +5,6 @@ import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shar
 
 import { TextGenerationError } from "../Errors.ts";
 import {
-  type BranchNameGenerationInput,
   type BranchNameGenerationResult,
   type CommitMessageGenerationResult,
   type PrContentGenerationResult,
@@ -51,15 +50,6 @@ function normalizeClaudeError(
   });
 }
 
-function toClaudeJsonSchema(schema: Schema.Top): string {
-  const document = Schema.toJsonSchemaDocument(schema);
-  const jsonSchema =
-    document.definitions && Object.keys(document.definitions).length > 0
-      ? { ...document.schema, $defs: document.definitions }
-      : document.schema;
-  return JSON.stringify(jsonSchema);
-}
-
 function limitSection(value: string, maxChars: number): string {
   if (value.length <= maxChars) return value;
   const truncated = value.slice(0, maxChars);
@@ -86,19 +76,31 @@ function sanitizePrTitle(raw: string): string {
   return "Update project changes";
 }
 
-/** Parse the result value from `claude --output-format json` wrapper output.
+/**
+ * Extract the `structured_output` object from `claude --output-format json
+ * --json-schema` wrapper output.  When `--json-schema` is supplied the CLI
+ * places the validated object in `"structured_output"` rather than encoding
+ * it as a string in `"result"`.
  *
  * The CLI may emit either a single JSON object or NDJSON (one JSON object per
- * line, e.g. when streaming internally).  In both cases we look for an entry
- * with `"type": "result"` and return its `result` string field.
+ * line).  In both cases we look for an entry with `"type": "result"` and
+ * return its `structured_output` object field.
+ *
+ * Returns `null` when no `structured_output` object can be found.
  */
-function extractResultText(rawOutput: string): string {
+function extractStructuredOutput(rawOutput: string): Record<string, unknown> | null {
+  const tryExtract = (obj: Record<string, unknown>): Record<string, unknown> | null => {
+    if (obj.structured_output !== null && typeof obj.structured_output === "object") {
+      return obj.structured_output as Record<string, unknown>;
+    }
+    return null;
+  };
+
   // Fast path: the whole output is a single JSON wrapper object.
   try {
     const wrapper = JSON.parse(rawOutput) as Record<string, unknown>;
-    if (typeof wrapper.result === "string") {
-      return wrapper.result;
-    }
+    const extracted = tryExtract(wrapper);
+    if (extracted !== null) return extracted;
   } catch {
     // Not a single JSON object — fall through to NDJSON handling.
   }
@@ -110,26 +112,25 @@ function extractResultText(rawOutput: string): string {
     if (!line) continue;
     try {
       const obj = JSON.parse(line) as Record<string, unknown>;
-      if (obj.type === "result" && typeof obj.result === "string") {
-        return obj.result;
+      if (obj.type === "result") {
+        const extracted = tryExtract(obj);
+        if (extracted !== null) return extracted;
       }
     } catch {
       // Skip non-JSON lines.
     }
   }
 
-  // Final fallback: return raw output and let the caller handle the error.
-  return rawOutput;
+  return null;
 }
 
-/**
- * Strip a markdown code fence if Claude wrapped its JSON response in one.
- * e.g. "```json\n{...}\n```" → "{...}"
- */
-function stripCodeFence(text: string): string {
-  const match = text.match(/^```(?:json)?\s*\n([\s\S]*?)\n```\s*$/);
-  if (match?.[1] != null) return match[1];
-  return text;
+function toClaudeJsonSchema(schema: Schema.Top): string {
+  const document = Schema.toJsonSchemaDocument(schema);
+  const jsonSchema =
+    document.definitions && Object.keys(document.definitions).length > 0
+      ? { ...document.schema, $defs: document.definitions }
+      : document.schema;
+  return JSON.stringify(jsonSchema);
 }
 
 const makeClaudeCodeTextGeneration = Effect.gen(function* () {
@@ -165,8 +166,6 @@ const makeClaudeCodeTextGeneration = Effect.gen(function* () {
     outputSchemaJson: S;
   }): Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]> =>
     Effect.gen(function* () {
-      const schemaArg = toClaudeJsonSchema(outputSchemaJson);
-
       const command = ChildProcess.make(
         "claude",
         [
@@ -175,10 +174,10 @@ const makeClaudeCodeTextGeneration = Effect.gen(function* () {
           "text",
           "--output-format",
           "json",
-          "--json-schema",
-          schemaArg,
           "--no-session-persistence",
           "--dangerously-skip-permissions",
+          "--json-schema",
+          toClaudeJsonSchema(outputSchemaJson),
         ],
         {
           cwd,
@@ -226,39 +225,37 @@ const makeClaudeCodeTextGeneration = Effect.gen(function* () {
         );
       }
 
-      // claude --output-format json wraps the response: { "result": "<text>", ... }
-      // When --json-schema is used, the result text is the JSON matching that schema.
+      // claude --output-format json --json-schema puts the validated object in
+      // "structured_output" (already parsed — no JSON.parse needed).
       // The CLI may emit NDJSON (one object per line) or a single JSON object.
-      // Claude may also wrap its JSON in a markdown code fence; strip that too.
-      const resultText = stripCodeFence(extractResultText(stdout.trim()));
+      const rawStdout = stdout.trim();
+      const rawStderr = stderr.trim();
+      yield* Effect.log(
+        `[${operation}] stdout (first 1000): ${JSON.stringify(rawStdout.slice(0, 1000))} | stderr (first 300): ${JSON.stringify(rawStderr.slice(0, 300))}`,
+      );
 
-      return yield* Effect.flatMap(
-        Effect.try({
-          try: () => JSON.parse(resultText) as unknown,
-          catch: (e) => {
-            const stderrHint = stderr.trim();
-            const detail = [
-              `Claude returned invalid JSON for operation "${operation}".`,
-              stderrHint.length > 0 ? `stderr: ${stderrHint.slice(0, 300)}` : null,
-              `result (first 500 chars): ${resultText.slice(0, 500)}`,
-            ]
-              .filter(Boolean)
-              .join("\n");
-            return new TextGenerationError({ operation, detail, cause: e });
-          },
-        }),
-        (parsed) =>
-          Schema.decodeEffect(outputSchemaJson)(parsed).pipe(
-            Effect.catchTag("SchemaError", (cause) =>
-              Effect.fail(
-                new TextGenerationError({
-                  operation,
-                  detail: "Claude returned unexpected output structure.",
-                  cause,
-                }),
-              ),
-            ),
+      const structuredOutput = extractStructuredOutput(rawStdout);
+      if (structuredOutput === null) {
+        const detail = [
+          `Claude returned no structured output for operation "${operation}".`,
+          rawStderr.length > 0 ? `stderr: ${rawStderr.slice(0, 300)}` : null,
+          `raw stdout (first 500): ${rawStdout.slice(0, 500)}`,
+        ]
+          .filter(Boolean)
+          .join("\n");
+        return yield* Effect.fail(new TextGenerationError({ operation, detail }));
+      }
+
+      return yield* Schema.decodeEffect(outputSchemaJson)(structuredOutput).pipe(
+        Effect.catchTag("SchemaError", (cause) =>
+          Effect.fail(
+            new TextGenerationError({
+              operation,
+              detail: "Claude returned unexpected output structure.",
+              cause,
+            }),
           ),
+        ),
       );
     }).pipe(
       Effect.scoped,
