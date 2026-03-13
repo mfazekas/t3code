@@ -13,6 +13,7 @@ import ProjectScriptsControl, { type NewProjectScriptInput } from "../ProjectScr
 import { Toggle } from "../ui/toggle";
 import { SidebarTrigger } from "../ui/sidebar";
 import { OpenInPicker } from "./OpenInPicker";
+import { SessionDebugButton, type SessionDebugInfo } from "./SessionDebugButton";
 
 interface ChatHeaderProps {
   activeThreadId: ThreadId;
@@ -31,6 +32,7 @@ interface ChatHeaderProps {
   onAddProjectScript: (input: NewProjectScriptInput) => Promise<void>;
   onUpdateProjectScript: (scriptId: string, input: NewProjectScriptInput) => Promise<void>;
   onDeleteProjectScript: (scriptId: string) => Promise<void>;
+  sessionDebugInfo: SessionDebugInfo | undefined;
   onToggleDiff: () => void;
 }
 
@@ -51,6 +53,7 @@ export const ChatHeader = memo(function ChatHeader({
   onAddProjectScript,
   onUpdateProjectScript,
   onDeleteProjectScript,
+  sessionDebugInfo,
   onToggleDiff,
 }: ChatHeaderProps) {
   return (
@@ -118,6 +121,7 @@ export const ChatHeader = memo(function ChatHeader({
                 : "Toggle diff panel"}
           </TooltipPopup>
         </Tooltip>
+        {sessionDebugInfo && <SessionDebugButton info={sessionDebugInfo} />}
       </div>
     </div>
   );

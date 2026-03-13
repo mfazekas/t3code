@@ -579,6 +579,7 @@ describe("hasToolActivityForTurn", () => {
 describe("isLatestTurnSettled", () => {
   const latestTurn = {
     turnId: TurnId.makeUnsafe("turn-1"),
+    state: "running",
     startedAt: "2026-02-27T21:10:00.000Z",
     completedAt: "2026-02-27T21:10:06.000Z",
   } as const;
@@ -615,6 +616,7 @@ describe("isLatestTurnSettled", () => {
       isLatestTurnSettled(
         {
           turnId: TurnId.makeUnsafe("turn-1"),
+          state: "running",
           startedAt: null,
           completedAt: "2026-02-27T21:10:06.000Z",
         },
@@ -627,6 +629,7 @@ describe("isLatestTurnSettled", () => {
 describe("deriveActiveWorkStartedAt", () => {
   const latestTurn = {
     turnId: TurnId.makeUnsafe("turn-1"),
+    state: "running",
     startedAt: "2026-02-27T21:10:00.000Z",
     completedAt: "2026-02-27T21:10:06.000Z",
   } as const;
@@ -662,6 +665,7 @@ describe("deriveActiveWorkStartedAt", () => {
       deriveActiveWorkStartedAt(
         {
           turnId: TurnId.makeUnsafe("turn-1"),
+          state: "completed",
           startedAt: "2026-02-27T21:10:00.000Z",
           completedAt: "2026-02-27T21:10:06.000Z",
         },
@@ -677,17 +681,19 @@ describe("PROVIDER_OPTIONS", () => {
     const claude = PROVIDER_OPTIONS.find((option) => option.value === "claudeCode");
     const cursor = PROVIDER_OPTIONS.find((option) => option.value === "cursor");
     expect(PROVIDER_OPTIONS).toEqual([
-      { value: "codex", label: "Codex" },
-      { value: "claudeCode", label: "Claude Code" },
-      { value: "cursor", label: "Cursor" },
+      { value: "codex", label: "Codex", available: true },
+      { value: "claudeCode", label: "Claude Code", available: true },
+      { value: "cursor", label: "Cursor", available: false },
     ]);
     expect(claude).toEqual({
       value: "claudeCode",
       label: "Claude Code",
+      available: true,
     });
     expect(cursor).toEqual({
       value: "cursor",
       label: "Cursor",
+      available: false,
     });
   });
 });
