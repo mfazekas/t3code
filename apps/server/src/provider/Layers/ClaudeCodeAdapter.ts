@@ -24,6 +24,7 @@ import {
   EventId,
   type ProviderApprovalDecision,
   ProviderItemId,
+  type ProviderInteractionMode,
   type ProviderRuntimeEvent,
   type ProviderRuntimeTurnStatus,
   type ProviderSendTurnInput,
@@ -93,8 +94,10 @@ interface ToolInFlight {
 
 interface ClaudeSessionContext {
   session: ProviderSession;
-  readonly promptQueue: Queue.Queue<PromptQueueItem>;
-  readonly query: ClaudeQueryRuntime;
+  /** Mutable: replaced when interaction mode changes (session restart). */
+  promptQueue: Queue.Queue<PromptQueueItem>;
+  /** Mutable: replaced when interaction mode changes (session restart). */
+  query: ClaudeQueryRuntime;
   readonly startedAt: string;
   resumeSessionId: string | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
@@ -107,6 +110,13 @@ interface ClaudeSessionContext {
   lastAssistantUuid: string | undefined;
   lastThreadStartedId: string | undefined;
   stopped: boolean;
+  /** Tracks the active interaction mode so we can detect changes between turns. */
+  interactionMode: ProviderInteractionMode | undefined;
+  /** Stored to rebuild queryOptions on session restart (mode change). */
+  readonly canUseTool: CanUseTool;
+  readonly permissionMode: PermissionMode | undefined;
+  readonly maxThinkingTokens: number | undefined;
+  readonly pathToClaudeCodeExecutable: string | undefined;
 }
 
 interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
@@ -463,6 +473,151 @@ function sdkNativeItemId(message: SDKMessage): string | undefined {
   return undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Plan Mode support
+// ---------------------------------------------------------------------------
+
+/**
+ * System prompt appended to Claude Code's default prompt when Plan Mode is
+ * active.  Mirrors the 3-phase structure of CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS
+ * but is adapted for Claude Code's native tooling (no `request_user_input` tool).
+ */
+export const CLAUDE_CODE_PLAN_MODE_SYSTEM_PROMPT = `<collaboration_mode># Plan Mode (Conversational)
+
+You work in 3 phases, and you should *chat your way* to a great plan before finalizing it. A great plan is very detailed—intent- and implementation-wise—so that it can be handed to another engineer or agent to be implemented right away. It must be **decision complete**, where the implementer does not need to make any decisions.
+
+## Mode rules (strict)
+
+You are in **Plan Mode** until the developer explicitly switches you back to Default mode.
+
+Plan Mode is not changed by user intent, tone, or imperative language. If a user asks for execution while still in Plan Mode, treat it as a request to **plan the execution**, not perform it.
+
+## Execution vs. mutation in Plan Mode
+
+You may explore and execute **non-mutating** actions that improve the plan. You must not perform **mutating** actions.
+
+### Allowed (non-mutating, plan-improving)
+
+Actions that gather truth, reduce ambiguity, or validate feasibility without changing repo-tracked state. Examples:
+
+* Reading or searching files, configs, schemas, types, manifests, and docs
+* Static analysis, inspection, and repo exploration
+* Dry-run style commands when they do not edit repo-tracked files
+* Tests, builds, or checks that may write to caches or build artifacts (for example, \`target/\`, \`.cache/\`, or snapshots) so long as they do not edit repo-tracked files
+
+### Not allowed (mutating, plan-executing)
+
+Actions that implement the plan or change repo-tracked state. Examples:
+
+* Editing or writing files
+* Running formatters or linters that rewrite files
+* Applying patches, migrations, or codegen that updates repo-tracked files
+* Side-effectful commands whose purpose is to carry out the plan rather than refine it
+
+When in doubt: if the action would reasonably be described as "doing the work" rather than "planning the work," do not do it.
+
+## PHASE 1 - Ground in the environment (explore first, ask second)
+
+Begin by grounding yourself in the actual environment. Eliminate unknowns in the prompt by discovering facts, not by asking the user. Resolve all questions that can be answered through exploration or inspection. Identify missing or ambiguous details only if they cannot be derived from the environment. Silent exploration between turns is allowed and encouraged.
+
+Before asking the user any question, perform at least one targeted non-mutating exploration pass (for example: search relevant files, inspect likely entrypoints/configs, confirm current implementation shape), unless no local environment/repo is available.
+
+Exception: you may ask clarifying questions about the user's prompt before exploring, ONLY if there are obvious ambiguities or contradictions in the prompt itself. However, if ambiguity might be resolved by exploring, always prefer exploring first.
+
+Do not ask questions that can be answered from the repo or system (for example, "where is this struct?" or "which UI component should we use?" when exploration can make it clear). Only ask once you have exhausted reasonable non-mutating exploration.
+
+## PHASE 2 - Intent chat (what they actually want)
+
+* Keep asking until you can clearly state: goal + success criteria, audience, in/out of scope, constraints, current state, and the key preferences/tradeoffs.
+* Bias toward questions over guessing: if any high-impact ambiguity remains, do NOT plan yet—ask.
+
+## PHASE 3 - Implementation chat (what/how we'll build)
+
+* Once intent is stable, keep asking until the spec is decision complete: approach, interfaces (APIs/schemas/I/O), data flow, edge cases/failure modes, testing + acceptance criteria, rollout/monitoring, and any migrations/compat constraints.
+
+## Asking questions
+
+Critical rules:
+
+* Offer only meaningful multiple-choice options; don't include filler choices that are obviously wrong or irrelevant.
+* In rare cases where an unavoidable, important question can't be expressed with reasonable multiple-choice options (due to extreme ambiguity), ask it directly.
+
+You SHOULD ask many questions, but each question must:
+
+* materially change the spec/plan, OR
+* confirm/lock an assumption, OR
+* choose between meaningful tradeoffs.
+* not be answerable by non-mutating commands.
+
+## Two kinds of unknowns (treat differently)
+
+1. **Discoverable facts** (repo/system truth): explore first.
+
+   * Before asking, run targeted searches and check likely sources of truth (configs/manifests/entrypoints/schemas/types/constants).
+   * Ask only if: multiple plausible candidates; nothing found but you need a missing identifier/context; or ambiguity is actually product intent.
+   * If asking, present concrete candidates (paths/service names) + recommend one.
+   * Never ask questions you can answer from your environment (e.g., "where is this struct").
+
+2. **Preferences/tradeoffs** (not discoverable): ask early.
+
+   * These are intent or implementation preferences that cannot be derived from exploration.
+   * Provide 2-4 mutually exclusive options + a recommended default.
+   * If unanswered, proceed with the recommended option and record it as an assumption in the final plan.
+
+## Finalization rule
+
+Only output the final plan when it is decision complete and leaves no decisions to the implementer.
+
+When you present the official plan, wrap it in a \`<proposed_plan>\` block so the client can render it specially:
+
+1) The opening tag must be on its own line.
+2) Start the plan content on the next line (no text on the same line as the tag).
+3) The closing tag must be on its own line.
+4) Use Markdown inside the block.
+5) Keep the tags exactly as \`<proposed_plan>\` and \`</proposed_plan>\` (do not translate or rename them), even if the plan content is in another language.
+
+Example:
+
+<proposed_plan>
+plan content
+</proposed_plan>
+
+plan content should be human and agent digestible. The final plan must be plan-only and include:
+
+* A clear title
+* A brief summary section
+* Important changes or additions to public APIs/interfaces/types
+* Test cases and scenarios
+* Explicit assumptions and defaults chosen where needed
+
+Do not ask "should I proceed?" in the final output. The user can easily switch out of Plan mode and request implementation if you have included a \`<proposed_plan>\` block in your response. Alternatively, they can decide to stay in Plan mode and continue refining the plan.
+
+Only produce at most one \`<proposed_plan>\` block per turn, and only when you are presenting a complete spec.
+</collaboration_mode>`;
+
+const PROPOSED_PLAN_BLOCK_REGEX = /<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/i;
+
+function extractProposedPlanMarkdown(text: string | undefined): string | undefined {
+  const match = text ? PROPOSED_PLAN_BLOCK_REGEX.exec(text) : null;
+  const planMarkdown = match?.[1]?.trim();
+  return planMarkdown && planMarkdown.length > 0 ? planMarkdown : undefined;
+}
+
+function buildSystemPromptForInteractionMode(
+  interactionMode: ProviderInteractionMode | undefined,
+): ClaudeQueryOptions["systemPrompt"] {
+  if (interactionMode === "plan") {
+    return {
+      type: "preset",
+      preset: "claude_code",
+      append: CLAUDE_CODE_PLAN_MODE_SYSTEM_PROMPT,
+    };
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+
 function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
   return Effect.gen(function* () {
     const nativeEventLogger =
@@ -617,6 +772,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
       context: ClaudeSessionContext,
       message: string,
       cause?: unknown,
+      errorClass: "provider_error" | "context_overflow" = "provider_error",
     ): Effect.Effect<void> =>
       Effect.gen(function* () {
         if (cause !== undefined) {
@@ -633,7 +789,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           ...(turnState ? { turnId: asCanonicalTurnId(turnState.turnId) } : {}),
           payload: {
             message,
-            class: "provider_error",
+            class: errorClass,
             ...(cause !== undefined ? { detail: cause } : {}),
           },
           providerRefs: {
@@ -749,6 +905,31 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           id: turnState.turnId,
           items: [...turnState.items],
         });
+
+        // Detect a <proposed_plan> block in the assistant's response and
+        // emit a first-class plan event so the orchestration layer can
+        // persist and surface it identically to the Codex provider.
+        const proposedPlanMarkdown = extractProposedPlanMarkdown(
+          turnState.fallbackAssistantText || undefined,
+        );
+        if (proposedPlanMarkdown) {
+          const planStamp = yield* makeEventStamp();
+          yield* offerRuntimeEvent({
+            type: "turn.proposed.completed",
+            eventId: planStamp.eventId,
+            provider: PROVIDER,
+            createdAt: planStamp.createdAt,
+            threadId: context.session.threadId,
+            turnId: turnState.turnId,
+            payload: {
+              planMarkdown: proposedPlanMarkdown,
+            },
+            providerRefs: {
+              ...providerThreadRef(context),
+              providerTurnId: String(turnState.turnId),
+            },
+          });
+        }
 
         const stamp = yield* makeEventStamp();
         yield* offerRuntimeEvent({
@@ -1022,7 +1203,15 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
         );
 
         if (status === "failed") {
-          yield* emitRuntimeError(context, errorMessage ?? "Claude turn failed.");
+          const isContextOverflow =
+            errorMessage != null &&
+            errorMessage.toLowerCase().includes("prompt is too long");
+          yield* emitRuntimeError(
+            context,
+            errorMessage ?? "Claude turn failed.",
+            undefined,
+            isContextOverflow ? "context_overflow" : "provider_error",
+          );
         }
 
         yield* completeTurn(context, status, errorMessage, message);
@@ -1327,6 +1516,92 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
         );
         yield* Effect.log("SDK stream ended");
       }).pipe(Effect.annotateLogs({ threadId: String(context.session.threadId) }));
+
+    /**
+     * Restarts the underlying SDK query session when the interaction mode
+     * changes between turns (Option B — clean restart with resume).
+     *
+     * - Closes the old query and shuts down the old prompt queue.
+     * - Creates a new prompt queue + query with the updated systemPrompt.
+     * - Resumes from the current `resumeSessionId` / `lastAssistantUuid` so
+     *   conversation history is preserved by Claude Code.
+     * - Mutates `context.promptQueue`, `context.query`, and
+     *   `context.interactionMode` in place so all existing closures
+     *   (canUseTool, runSdkStream) keep working without re-wiring.
+     */
+    const restartQueryForInteractionMode = (
+      context: ClaudeSessionContext,
+      newInteractionMode: ProviderInteractionMode,
+    ): Effect.Effect<void, ProviderAdapterProcessError> =>
+      Effect.gen(function* () {
+        yield* Effect.log("Restarting query for interaction mode change").pipe(
+          Effect.annotateLogs({
+            threadId: String(context.session.threadId),
+            previousMode: context.interactionMode ?? "default",
+            newMode: newInteractionMode,
+          }),
+        );
+
+        // Stop the old query and drain the old prompt queue.
+        context.query.close();
+        yield* Queue.shutdown(context.promptQueue);
+
+        // Build a fresh prompt queue and async-iterable prompt stream.
+        const newPromptQueue = yield* Queue.unbounded<PromptQueueItem>();
+        const newPrompt = Stream.fromQueue(newPromptQueue).pipe(
+          Stream.filter((item) => item.type === "message"),
+          Stream.map((item) => item.message),
+          Stream.toAsyncIterable,
+        );
+
+        // Build new query options reusing all session-level settings, but with
+        // an updated systemPrompt and the current resume cursor.
+        const systemPrompt = buildSystemPromptForInteractionMode(newInteractionMode);
+        const newQueryOptions: ClaudeQueryOptions = {
+          ...(context.session.cwd ? { cwd: context.session.cwd } : {}),
+          ...(context.session.model ? { model: context.session.model } : {}),
+          ...(context.pathToClaudeCodeExecutable
+            ? { pathToClaudeCodeExecutable: context.pathToClaudeCodeExecutable }
+            : {}),
+          ...(context.permissionMode ? { permissionMode: context.permissionMode } : {}),
+          ...(context.permissionMode === "bypassPermissions"
+            ? { allowDangerouslySkipPermissions: true }
+            : {}),
+          ...(context.maxThinkingTokens !== undefined
+            ? { maxThinkingTokens: context.maxThinkingTokens }
+            : {}),
+          // Resume from where the last turn left off.
+          ...(context.resumeSessionId ? { resume: context.resumeSessionId } : {}),
+          ...(context.lastAssistantUuid ? { resumeSessionAt: context.lastAssistantUuid } : {}),
+          includePartialMessages: true,
+          canUseTool: context.canUseTool,
+          env: process.env,
+          ...(context.session.cwd ? { additionalDirectories: [context.session.cwd] } : {}),
+          ...(systemPrompt !== undefined ? { systemPrompt } : {}),
+        };
+
+        const newQueryRuntime = yield* Effect.try({
+          try: () => createQuery({ prompt: newPrompt, options: newQueryOptions }),
+          catch: (cause) =>
+            new ProviderAdapterProcessError({
+              provider: PROVIDER,
+              threadId: context.session.threadId,
+              detail: toMessage(
+                cause,
+                "Failed to restart Claude runtime session for interaction mode change.",
+              ),
+              cause,
+            }),
+        });
+
+        // Swap the mutable fields on the context in place.
+        context.promptQueue = newPromptQueue;
+        context.query = newQueryRuntime;
+        context.interactionMode = newInteractionMode;
+
+        // Fork a new SDK stream over the new query.
+        Effect.runFork(runSdkStream(context));
+      });
 
     const stopSessionInternal = (
       context: ClaudeSessionContext,
@@ -1663,6 +1938,11 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           lastAssistantUuid: resumeState?.resumeSessionAt,
           lastThreadStartedId: undefined,
           stopped: false,
+          interactionMode: undefined,
+          canUseTool,
+          permissionMode,
+          maxThinkingTokens: providerOptions?.maxThinkingTokens,
+          pathToClaudeCodeExecutable: providerOptions?.binaryPath,
         };
         yield* Ref.set(contextRef, context);
         sessions.set(threadId, context);
@@ -1737,6 +2017,17 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
             operation: "sendTurn",
             issue: `Thread '${input.threadId}' already has an active turn '${context.turnState.turnId}'.`,
           });
+        }
+
+        // Detect interaction mode changes and restart the underlying SDK query
+        // with the appropriate systemPrompt (Option B — clean restart with resume).
+        const effectiveCurrentMode = context.interactionMode ?? "default";
+        const requestedMode = input.interactionMode ?? "default";
+        if (requestedMode !== effectiveCurrentMode) {
+          yield* restartQueryForInteractionMode(context, requestedMode);
+        } else if (context.interactionMode === undefined) {
+          // First turn in default mode — no restart needed, just record the mode.
+          context.interactionMode = "default";
         }
 
         if (input.model) {

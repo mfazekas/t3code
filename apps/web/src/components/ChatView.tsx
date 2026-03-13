@@ -108,6 +108,7 @@ import {
   CopyIcon,
   CheckIcon,
   InfoIcon,
+  RotateCcwIcon,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import { Separator } from "./ui/separator";
@@ -2268,6 +2269,53 @@ export default function ChatView({ threadId }: ChatViewProps) {
     [activeThread, isConnecting, isRevertingCheckpoint, isSendBusy, phase, setThreadError],
   );
 
+  /**
+   * Recovery action for context-overflow errors ("Prompt is too long").
+   * Reverts to the last checkpoint so the model has room to respond again,
+   * and pre-populates the composer with the user's last message so they can
+   * retry without retyping.
+   */
+  const onRollBackContextOverflow = useCallback(async () => {
+    const api = readNativeApi();
+    if (!api || !activeThread || isRevertingCheckpoint) return;
+
+    // Find the last checkpoint turn count to revert to.
+    const lastCheckpoint = activeThread.turnDiffSummaries
+      .filter((s) => typeof s.checkpointTurnCount === "number")
+      .at(-1);
+    const targetTurnCount = lastCheckpoint?.checkpointTurnCount ?? 0;
+
+    // Grab the last user message so we can restore it in the composer.
+    const lastUserMessage = [...activeThread.messages].reverse().find((m) => m.role === "user");
+
+    setIsRevertingCheckpoint(true);
+    setThreadError(activeThread.id, null);
+    try {
+      await api.orchestration.dispatchCommand({
+        type: "thread.checkpoint.revert",
+        commandId: newCommandId(),
+        threadId: activeThread.id,
+        turnCount: targetTurnCount,
+        createdAt: new Date().toISOString(),
+      });
+      if (lastUserMessage) {
+        setComposerDraftPrompt(threadId, lastUserMessage.text);
+      }
+    } catch (err) {
+      setThreadError(
+        activeThread.id,
+        err instanceof Error ? err.message : "Failed to revert thread state.",
+      );
+    }
+    setIsRevertingCheckpoint(false);
+  }, [
+    activeThread,
+    isRevertingCheckpoint,
+    setComposerDraftPrompt,
+    setThreadError,
+    threadId,
+  ]);
+
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
     const api = readNativeApi();
@@ -3389,6 +3437,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
       <ThreadErrorBanner
         error={activeThread.error}
         onDismiss={() => setThreadError(activeThread.id, null)}
+        onRollBack={onRollBackContextOverflow}
       />
       {/* Main content area with optional plan sidebar */}
       <div className="flex min-h-0 min-w-0 flex-1">
@@ -4319,11 +4368,53 @@ const ChatHeader = memo(function ChatHeader({
 const ThreadErrorBanner = memo(function ThreadErrorBanner({
   error,
   onDismiss,
+  onRollBack,
 }: {
   error: string | null;
   onDismiss?: () => void;
+  onRollBack?: () => void;
 }) {
   if (!error) return null;
+
+  const isContextOverflow = error.toLowerCase().includes("prompt is too long");
+
+  if (isContextOverflow) {
+    return (
+      <div className="pt-3 mx-auto max-w-3xl">
+        <Alert variant="error">
+          <CircleAlertIcon />
+          <AlertTitle>Conversation too long</AlertTitle>
+          <AlertDescription>
+            The conversation has grown too long for the model. Roll back to the last checkpoint to
+            free up context, then retry your message.
+          </AlertDescription>
+          <AlertAction>
+            {onRollBack && (
+              <button
+                type="button"
+                onClick={onRollBack}
+                className="inline-flex items-center gap-1.5 rounded-md bg-destructive/10 px-2.5 py-1 text-xs font-medium text-destructive transition-colors hover:bg-destructive/20"
+              >
+                <RotateCcwIcon className="size-3" />
+                Roll back &amp; retry
+              </button>
+            )}
+            {onDismiss && (
+              <button
+                type="button"
+                aria-label="Dismiss error"
+                className="inline-flex size-6 items-center justify-center rounded-md text-destructive/60 transition-colors hover:text-destructive"
+                onClick={onDismiss}
+              >
+                <XIcon className="size-3.5" />
+              </button>
+            )}
+          </AlertAction>
+        </Alert>
+      </div>
+    );
+  }
+
   return (
     <div className="pt-3 mx-auto max-w-3xl">
       <Alert variant="error">
