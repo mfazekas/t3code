@@ -56,6 +56,7 @@ const ClaudeCodeProviderStartOptions = Schema.Struct({
   binaryPath: Schema.optional(TrimmedNonEmptyStringSchema),
   permissionMode: Schema.optional(TrimmedNonEmptyStringSchema),
   maxThinkingTokens: Schema.optional(NonNegativeInt),
+  effort: Schema.optional(Schema.Literals(["low", "medium", "high"] as const)),
 });
 
 const CursorProviderStartOptions = Schema.Struct({

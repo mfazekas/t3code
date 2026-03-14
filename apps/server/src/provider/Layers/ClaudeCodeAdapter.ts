@@ -118,6 +118,8 @@ interface ClaudeSessionContext {
   readonly canUseTool: CanUseTool;
   readonly permissionMode: PermissionMode | undefined;
   readonly maxThinkingTokens: number | undefined;
+  /** Mutable: updated when the user changes effort level between turns. */
+  effort: "low" | "medium" | "high" | undefined;
   readonly pathToClaudeCodeExecutable: string | undefined;
 }
 
@@ -1627,6 +1629,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           ...(context.maxThinkingTokens !== undefined
             ? { maxThinkingTokens: context.maxThinkingTokens }
             : {}),
+          ...(context.effort ? { effort: context.effort } : {}),
           // Resume from where the last turn left off.
           ...(context.resumeSessionId ? { resume: context.resumeSessionId } : {}),
           ...(context.lastAssistantUuid ? { resumeSessionAt: context.lastAssistantUuid } : {}),
@@ -1937,6 +1940,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           ...(providerOptions?.maxThinkingTokens !== undefined
             ? { maxThinkingTokens: providerOptions.maxThinkingTokens }
             : {}),
+          ...(providerOptions?.effort ? { effort: providerOptions.effort } : {}),
           ...(resumeState?.resume ? { resume: resumeState.resume } : {}),
           ...(resumeState?.resumeSessionAt ? { resumeSessionAt: resumeState.resumeSessionAt } : {}),
           includePartialMessages: true,
@@ -1997,6 +2001,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           canUseTool,
           permissionMode,
           maxThinkingTokens: providerOptions?.maxThinkingTokens,
+          effort: providerOptions?.effort,
           pathToClaudeCodeExecutable: providerOptions?.binaryPath,
         };
         yield* Ref.set(contextRef, context);
@@ -2037,6 +2042,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
               ...(providerOptions?.maxThinkingTokens !== undefined
                 ? { maxThinkingTokens: providerOptions.maxThinkingTokens }
                 : {}),
+              ...(providerOptions?.effort ? { effort: providerOptions.effort } : {}),
             },
           },
           providerRefs: {},
@@ -2100,6 +2106,12 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
             try: () => context.query.setModel(input.model),
             catch: (cause) => toRequestError(input.threadId, "turn/setModel", cause),
           });
+        }
+
+        const requestedEffort = input.modelOptions?.claudeCode?.effort ?? undefined;
+        if (requestedEffort !== undefined && requestedEffort !== context.effort) {
+          context.effort = requestedEffort;
+          yield* restartQueryForInteractionMode(context, requestedMode);
         }
 
         const turnId = TurnId.makeUnsafe(yield* Random.nextUUIDv4);

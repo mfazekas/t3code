@@ -3,6 +3,7 @@ import {
   DEFAULT_MODEL_BY_PROVIDER,
   type EditorId,
   type KeybindingCommand,
+  type ClaudeCodeEffort,
   type CodexReasoningEffort,
   type CursorReasoningOption,
   type MessageId,
@@ -153,6 +154,7 @@ import {
 } from "./chat/ProviderModelPicker";
 import { ComposerCommandItem, ComposerCommandMenu } from "./chat/ComposerCommandMenu";
 import { ComposerPendingApprovalActions } from "./chat/ComposerPendingApprovalActions";
+import { ClaudeCodeTraitsPicker } from "./chat/ClaudeCodeTraitsPicker";
 import { CodexTraitsPicker } from "./chat/CodexTraitsPicker";
 import { CursorTraitsPicker } from "./chat/CursorTraitsPicker";
 import { CompactComposerControlsMenu } from "./chat/CompactComposerControlsMenu";
@@ -635,14 +637,24 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const selectedCodexFastModeEnabled =
     selectedProvider === "codex" ? composerDraft.codexFastMode : false;
   const selectedModelOptionsForDispatch = useMemo(() => {
-    if (selectedProvider !== "codex") {
-      return undefined;
+    if (selectedProvider === "codex") {
+      const codexOptions = {
+        ...(supportsReasoningEffort && selectedEffort ? { reasoningEffort: selectedEffort } : {}),
+        ...(selectedCodexFastModeEnabled ? { fastMode: true } : {}),
+      };
+      return Object.keys(codexOptions).length > 0 ? { codex: codexOptions } : undefined;
     }
-    const codexOptions = {
-      ...(supportsReasoningEffort && selectedEffort ? { reasoningEffort: selectedEffort } : {}),
-      ...(selectedCodexFastModeEnabled ? { fastMode: true } : {}),
-    };
-    return Object.keys(codexOptions).length > 0 ? { codex: codexOptions } : undefined;
+    if (selectedProvider === "claudeCode") {
+      const claudeCodeOptions = {
+        ...(supportsReasoningEffort && selectedEffort
+          ? { effort: selectedEffort as ClaudeCodeEffort }
+          : {}),
+      };
+      return Object.keys(claudeCodeOptions).length > 0
+        ? { claudeCode: claudeCodeOptions }
+        : undefined;
+    }
+    return undefined;
   }, [selectedCodexFastModeEnabled, selectedEffort, selectedProvider, supportsReasoningEffort]);
   const providerOptionsForDispatch = useMemo(() => {
     if (!settings.codexBinaryPath && !settings.codexHomePath) {
@@ -3977,6 +3989,18 @@ export default function ChatView({ threadId }: ChatViewProps) {
                                 options={reasoningOptions}
                                 onEffortChange={onEffortSelect}
                                 onFastModeChange={onCodexFastModeChange}
+                              />
+                            </>
+                          ) : selectedProvider === "claudeCode" && selectedEffort != null ? (
+                            <>
+                              <Separator
+                                orientation="vertical"
+                                className="mx-0.5 hidden h-4 sm:block"
+                              />
+                              <ClaudeCodeTraitsPicker
+                                effort={selectedEffort as ClaudeCodeEffort}
+                                options={reasoningOptions as ReadonlyArray<ClaudeCodeEffort>}
+                                onEffortChange={onEffortSelect}
                               />
                             </>
                           ) : null}
