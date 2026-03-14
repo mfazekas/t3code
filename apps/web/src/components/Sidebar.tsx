@@ -1472,20 +1472,6 @@ export default function Sidebar() {
                                             </TooltipPopup>
                                           </Tooltip>
                                         )}
-                                        {threadStatus && (
-                                          <span
-                                            className={`inline-flex items-center gap-1 text-[10px] ${threadStatus.colorClass}`}
-                                          >
-                                            <span
-                                              className={`h-1.5 w-1.5 rounded-full ${threadStatus.dotClass} ${
-                                                threadStatus.pulse ? "animate-pulse" : ""
-                                              }`}
-                                            />
-                                            <span className="hidden md:inline">
-                                              {threadStatus.label}
-                                            </span>
-                                          </span>
-                                        )}
                                         {renamingThreadId === thread.id ? (
                                           <input
                                             ref={(el) => {
@@ -1532,6 +1518,18 @@ export default function Sidebar() {
                                         )}
                                       </div>
                                       <div className="ml-auto flex shrink-0 items-center gap-1.5">
+                                        {threadStatus && (
+                                          <span
+                                            title={threadStatus.label}
+                                            className="inline-flex items-center justify-center"
+                                          >
+                                            <span
+                                              className={`h-1.5 w-1.5 rounded-full ${threadStatus.dotClass} ${
+                                                threadStatus.pulse ? "animate-pulse" : ""
+                                              }`}
+                                            />
+                                          </span>
+                                        )}
                                         {terminalStatus && (
                                           <span
                                             role="img"

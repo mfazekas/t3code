@@ -112,6 +112,8 @@ interface ClaudeSessionContext {
   stopped: boolean;
   /** Tracks the active interaction mode so we can detect changes between turns. */
   interactionMode: ProviderInteractionMode | undefined;
+  /** True when the SDK stream ended unexpectedly (process died between turns). */
+  queryDead: boolean;
   /** Stored to rebuild queryOptions on session restart (mode change). */
   readonly canUseTool: CanUseTool;
   readonly permissionMode: PermissionMode | undefined;
@@ -294,6 +296,47 @@ function titleForTool(itemType: CanonicalItemType): string {
     default:
       return "Item";
   }
+}
+
+/**
+ * Wraps an Effect-based AsyncIterable so that fiber interruption errors
+ * (from queue shutdown) become a clean end-of-stream signal instead of
+ * throwing.  Without this, shutting down the prompt queue during an
+ * interaction-mode restart causes the Claude SDK's streamInput to receive
+ * an unhandled rejection that crashes the entire backend process.
+ */
+function safeAsyncIterable<T>(source: AsyncIterable<T>): AsyncIterable<T> {
+  return {
+    [Symbol.asyncIterator]() {
+      const iterator = source[Symbol.asyncIterator]();
+      return {
+        async next(): Promise<IteratorResult<T>> {
+          try {
+            return await iterator.next();
+          } catch {
+            return { done: true, value: undefined as T };
+          }
+        },
+        async return(value?: T): Promise<IteratorResult<T>> {
+          try {
+            return await (iterator.return?.(value) ?? Promise.resolve({ done: true as const, value: undefined as T }));
+          } catch {
+            return { done: true, value: undefined as T };
+          }
+        },
+      };
+    },
+  };
+}
+
+function buildPromptStream(queue: Queue.Queue<PromptQueueItem>): AsyncIterable<SDKUserMessage> {
+  return safeAsyncIterable(
+    Stream.fromQueue(queue).pipe(
+      Stream.filter((item) => item.type === "message"),
+      Stream.map((item) => item.message),
+      Stream.toAsyncIterable,
+    ),
+  );
 }
 
 function buildUserMessage(input: ProviderSendTurnInput): SDKUserMessage {
@@ -1515,6 +1558,24 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           ),
         );
         yield* Effect.log("SDK stream ended");
+        // If the stream ended cleanly but there's still an open turn, the
+        // claude process exited without emitting a result message (e.g. OOM,
+        // context-overflow crash, or unexpected exit with code 1).  Fail the
+        // turn now so the UI doesn't hang silently.
+        if (context.turnState && !context.stopped) {
+          const errorMessage = "Claude process exited unexpectedly.";
+          yield* Effect.logWarning("SDK stream ended with an open turn — failing turn", {
+            turnId: String(context.turnState.turnId),
+          });
+          yield* emitRuntimeError(context, errorMessage);
+          yield* completeTurn(context, "failed", errorMessage);
+        }
+
+        // Mark the query as dead so the next sendTurn can auto-restart
+        // instead of crashing with "ProcessTransport is not ready".
+        if (!context.stopped) {
+          context.queryDead = true;
+        }
       }).pipe(Effect.annotateLogs({ threadId: String(context.session.threadId) }));
 
     /**
@@ -1548,11 +1609,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
 
         // Build a fresh prompt queue and async-iterable prompt stream.
         const newPromptQueue = yield* Queue.unbounded<PromptQueueItem>();
-        const newPrompt = Stream.fromQueue(newPromptQueue).pipe(
-          Stream.filter((item) => item.type === "message"),
-          Stream.map((item) => item.message),
-          Stream.toAsyncIterable,
-        );
+        const newPrompt = buildPromptStream(newPromptQueue);
 
         // Build new query options reusing all session-level settings, but with
         // an updated systemPrompt and the current resume cursor.
@@ -1598,6 +1655,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
         context.promptQueue = newPromptQueue;
         context.query = newQueryRuntime;
         context.interactionMode = newInteractionMode;
+        context.queryDead = false;
 
         // Fork a new SDK stream over the new query.
         Effect.runFork(runSdkStream(context));
@@ -1713,11 +1771,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
         const threadId = input.threadId;
 
         const promptQueue = yield* Queue.unbounded<PromptQueueItem>();
-        const prompt = Stream.fromQueue(promptQueue).pipe(
-          Stream.filter((item) => item.type === "message"),
-          Stream.map((item) => item.message),
-          Stream.toAsyncIterable,
-        );
+        const prompt = buildPromptStream(promptQueue);
 
         const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
         const inFlightTools = new Map<number, ToolInFlight>();
@@ -1938,6 +1992,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           lastAssistantUuid: resumeState?.resumeSessionAt,
           lastThreadStartedId: undefined,
           stopped: false,
+          queryDead: false,
           interactionMode: undefined,
           canUseTool,
           permissionMode,
@@ -2019,10 +2074,20 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           });
         }
 
+        // If the underlying Claude process died between turns, restart it
+        // transparently so the user doesn't see "ProcessTransport is not ready".
+        const requestedMode = input.interactionMode ?? context.interactionMode ?? "default";
+        if (context.queryDead) {
+          yield* emitRuntimeWarning(
+            context,
+            "Claude process exited unexpectedly — restarting session.",
+          );
+          yield* restartQueryForInteractionMode(context, requestedMode);
+        }
+
         // Detect interaction mode changes and restart the underlying SDK query
         // with the appropriate systemPrompt (Option B — clean restart with resume).
         const effectiveCurrentMode = context.interactionMode ?? "default";
-        const requestedMode = input.interactionMode ?? "default";
         if (requestedMode !== effectiveCurrentMode) {
           yield* restartQueryForInteractionMode(context, requestedMode);
         } else if (context.interactionMode === undefined) {
