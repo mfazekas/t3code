@@ -114,8 +114,13 @@ interface ClaudeSessionContext {
   stopped: boolean;
   /** Tracks the active interaction mode so we can detect changes between turns. */
   interactionMode: ProviderInteractionMode | undefined;
-  /** True when the SDK stream ended unexpectedly (process died between turns). */
-  queryDead: boolean;
+  /**
+   * Set when the SDK stream ended unexpectedly (process died between turns).
+   * `false` when alive, or a reason string describing why the query died.
+   * "session_expired" means the resume session no longer exists on the server
+   * and auto-restart should NOT be attempted (user must start fresh).
+   */
+  queryDead: false | "crashed" | "session_expired";
   /** Stored to rebuild queryOptions on session restart (mode change). */
   readonly canUseTool: CanUseTool;
   readonly permissionMode: PermissionMode | undefined;
@@ -1285,19 +1290,39 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           }),
         );
 
+        let turnErrorMessage = errorMessage;
         if (status === "failed") {
-          const isContextOverflow =
-            errorMessage != null &&
-            errorMessage.toLowerCase().includes("prompt is too long");
+          const lowerError = errorMessage?.toLowerCase() ?? "";
+          const isContextOverflow = lowerError.includes("prompt is too long");
+          const isSessionExpired =
+            lowerError.includes("no conversation found") ||
+            lowerError.includes("no message found with message.uuid");
+          if (isSessionExpired) {
+            context.queryDead = "session_expired";
+            yield* Effect.logError("Session expired detected").pipe(
+              Effect.annotateLogs({
+                threadId: String(context.session.threadId),
+                originalError: errorMessage ?? "<none>",
+                hasResumeSessionId: String(!!context.resumeSessionId),
+                ...(context.resumeSessionId
+                  ? { resumeSessionId: context.resumeSessionId }
+                  : {}),
+                turnCount: String(context.turns.length),
+              }),
+            );
+            turnErrorMessage =
+              "The Claude session has expired and can no longer be resumed. " +
+              "Please start a new conversation.";
+          }
           yield* emitRuntimeError(
             context,
-            errorMessage ?? "Claude turn failed.",
+            turnErrorMessage ?? "Claude turn failed.",
             undefined,
             isContextOverflow ? "context_overflow" : "provider_error",
           );
         }
 
-        yield* completeTurn(context, status, errorMessage, message);
+        yield* completeTurn(context, status, turnErrorMessage, message);
       });
 
     const handleSystemMessage = (
@@ -1581,8 +1606,13 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
 
     const runSdkStream = (context: ClaudeSessionContext): Effect.Effect<void> =>
       Effect.gen(function* () {
+        // Capture the query reference so we can detect intentional restarts.
+        // When restartQueryForInteractionMode swaps context.query, this stream
+        // should not fail any turn that now belongs to the replacement query.
+        const streamQuery = context.query;
+
         yield* Effect.log("SDK stream starting");
-        yield* Stream.fromAsyncIterable(context.query, (cause) => cause).pipe(
+        yield* Stream.fromAsyncIterable(streamQuery, (cause) => cause).pipe(
           Stream.takeWhile(() => !context.stopped),
           Stream.runForEach((message) => handleSdkMessage(context, message)),
           Effect.catchCause((cause) =>
@@ -1590,14 +1620,32 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
               if (Cause.hasInterruptsOnly(cause) || context.stopped) {
                 return;
               }
+              // If the query was swapped by a restart, this stream was closed
+              // intentionally — don't fail the turn or log scary errors.
+              if (context.query !== streamQuery) {
+                return;
+              }
               const message = toMessage(Cause.squash(cause), "Claude runtime stream failed.");
               yield* Effect.logError("SDK stream failed", { error: message });
-              yield* emitRuntimeError(context, message, cause);
-              yield* completeTurn(context, "failed", message);
+              // Only fail the turn if it hasn't already been completed by a
+              // result message (e.g. "No conversation found").  Emitting a
+              // second turn.completed would overwrite the more specific error
+              // with a generic "process exited with code 1".
+              if (context.turnState) {
+                yield* emitRuntimeError(context, message, cause);
+                yield* completeTurn(context, "failed", message);
+              }
             }),
           ),
         );
         yield* Effect.log("SDK stream ended");
+
+        // If the query was swapped by an intentional restart, skip cleanup —
+        // the new stream owns the context now.
+        if (context.query !== streamQuery) {
+          return;
+        }
+
         // If the stream ended cleanly but there's still an open turn, the
         // claude process exited without emitting a result message (e.g. OOM,
         // context-overflow crash, or unexpected exit with code 1).  Fail the
@@ -1611,10 +1659,11 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           yield* completeTurn(context, "failed", errorMessage);
         }
 
-        // Mark the query as dead so the next sendTurn can auto-restart
-        // instead of crashing with "ProcessTransport is not ready".
-        if (!context.stopped) {
-          context.queryDead = true;
+        // Mark the query as dead so the next sendTurn knows the process is
+        // gone.  "session_expired" means the server rejected the resume ID
+        // and auto-restart should not be attempted.
+        if (!context.stopped && !context.queryDead) {
+          context.queryDead = "crashed";
         }
       }).pipe(Effect.annotateLogs({ threadId: String(context.session.threadId) }));
 
@@ -1669,9 +1718,16 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
             : {}),
           ...(context.effort ? { effort: context.effort } : {}),
           ...(context.chrome ? { extraArgs: { chrome: null } } : {}),
-          // Resume from where the last turn left off.
-          ...(context.resumeSessionId ? { resume: context.resumeSessionId } : {}),
-          ...(context.lastAssistantUuid ? { resumeSessionAt: context.lastAssistantUuid } : {}),
+          // Resume from where the last turn left off — but only if there are
+          // completed turns.  When the restart happens before the first turn
+          // (e.g. effort changed), the backend may not have persisted the
+          // session yet, causing "no conversation found" errors.
+          ...(context.turns.length > 0 && context.resumeSessionId
+            ? { resume: context.resumeSessionId }
+            : {}),
+          ...(context.turns.length > 0 && context.lastAssistantUuid
+            ? { resumeSessionAt: context.lastAssistantUuid }
+            : {}),
           includePartialMessages: true,
           canUseTool: context.canUseTool,
           env: process.env,
@@ -2135,9 +2191,18 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           });
         }
 
-        // If the underlying Claude process died between turns, restart it
-        // transparently so the user doesn't see "ProcessTransport is not ready".
+        // If the underlying Claude process died between turns, decide whether
+        // to auto-restart or surface a permanent error.
         const requestedMode = input.interactionMode ?? context.interactionMode ?? "default";
+        if (context.queryDead === "session_expired") {
+          return yield* new ProviderAdapterProcessError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+            detail:
+              "The Claude session has expired and can no longer be resumed. " +
+              "Please start a new conversation.",
+          });
+        }
         if (context.queryDead) {
           yield* emitRuntimeWarning(
             context,
