@@ -30,6 +30,8 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
   reasoningOptions: ReadonlyArray<CodexReasoningEffort>;
   onEffortSelect: (effort: CodexReasoningEffort) => void;
   onCodexFastModeChange: (enabled: boolean) => void;
+  chromeEnabled: boolean;
+  onToggleChromeEnabled: () => void;
   onToggleInteractionMode: () => void;
   onTogglePlanSidebar: () => void;
   onToggleRuntimeMode: () => void;
@@ -119,6 +121,21 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
           >
             <MenuRadioItem value="approval-required">Supervised</MenuRadioItem>
             <MenuRadioItem value="full-access">Full access</MenuRadioItem>
+          </MenuRadioGroup>
+        </MenuGroup>
+        <MenuDivider />
+        <MenuGroup>
+          <div className="px-2 py-1.5 font-medium text-muted-foreground text-xs">Chrome</div>
+          <MenuRadioGroup
+            value={props.chromeEnabled ? "on" : "off"}
+            onValueChange={(value) => {
+              if (!value) return;
+              const next = value === "on";
+              if (next !== props.chromeEnabled) props.onToggleChromeEnabled();
+            }}
+          >
+            <MenuRadioItem value="off">Disabled</MenuRadioItem>
+            <MenuRadioItem value="on">Enabled</MenuRadioItem>
           </MenuRadioGroup>
         </MenuGroup>
         {props.activePlan ? (

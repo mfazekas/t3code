@@ -121,6 +121,8 @@ interface ClaudeSessionContext {
   /** Mutable: updated when the user changes effort level between turns. */
   effort: "low" | "medium" | "high" | undefined;
   readonly pathToClaudeCodeExecutable: string | undefined;
+  /** Whether to pass --chrome to the Claude CLI via extraArgs. */
+  readonly chrome: boolean;
 }
 
 interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
@@ -1630,6 +1632,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
             ? { maxThinkingTokens: context.maxThinkingTokens }
             : {}),
           ...(context.effort ? { effort: context.effort } : {}),
+          ...(context.chrome ? { extraArgs: { chrome: null } } : {}),
           // Resume from where the last turn left off.
           ...(context.resumeSessionId ? { resume: context.resumeSessionId } : {}),
           ...(context.lastAssistantUuid ? { resumeSessionAt: context.lastAssistantUuid } : {}),
@@ -1923,6 +1926,9 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           );
 
         const providerOptions = input.providerOptions?.claudeCode;
+        const initialEffort =
+          input.modelOptions?.claudeCode?.effort ?? providerOptions?.effort;
+        const chromeEnabled = providerOptions?.chrome === true;
         const permissionMode =
           toPermissionMode(providerOptions?.permissionMode) ??
           (input.runtimeMode === "full-access" ? "bypassPermissions" : undefined);
@@ -1940,7 +1946,8 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           ...(providerOptions?.maxThinkingTokens !== undefined
             ? { maxThinkingTokens: providerOptions.maxThinkingTokens }
             : {}),
-          ...(providerOptions?.effort ? { effort: providerOptions.effort } : {}),
+          ...(initialEffort ? { effort: initialEffort } : {}),
+          ...(chromeEnabled ? { extraArgs: { chrome: null } } : {}),
           ...(resumeState?.resume ? { resume: resumeState.resume } : {}),
           ...(resumeState?.resumeSessionAt ? { resumeSessionAt: resumeState.resumeSessionAt } : {}),
           includePartialMessages: true,
@@ -1948,6 +1955,17 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           env: process.env,
           ...(input.cwd ? { additionalDirectories: [input.cwd] } : {}),
         };
+
+        yield* Effect.log("Creating SDK query").pipe(
+          Effect.annotateLogs({
+            threadId: String(threadId),
+            hasResume: String(!!queryOptions.resume),
+            hasResumeSessionAt: String(!!queryOptions.resumeSessionAt),
+            ...(queryOptions.resume ? { resumeId: queryOptions.resume } : {}),
+            chromeEnabled: String(chromeEnabled),
+            extraArgs: JSON.stringify(queryOptions.extraArgs ?? null),
+          }),
+        );
 
         const queryRuntime = yield* Effect.try({
           try: () =>
@@ -2001,8 +2019,9 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           canUseTool,
           permissionMode,
           maxThinkingTokens: providerOptions?.maxThinkingTokens,
-          effort: providerOptions?.effort,
+          effort: initialEffort,
           pathToClaudeCodeExecutable: providerOptions?.binaryPath,
+          chrome: chromeEnabled,
         };
         yield* Ref.set(contextRef, context);
         sessions.set(threadId, context);

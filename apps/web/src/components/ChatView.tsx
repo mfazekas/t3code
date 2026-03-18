@@ -100,6 +100,7 @@ import {
   ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
+  ChromeIcon,
   CircleAlertIcon,
   ListTodoIcon,
   LockIcon,
@@ -263,6 +264,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const setComposerDraftProvider = useComposerDraftStore((store) => store.setProvider);
   const setComposerDraftModel = useComposerDraftStore((store) => store.setModel);
   const setComposerDraftRuntimeMode = useComposerDraftStore((store) => store.setRuntimeMode);
+  const setComposerDraftChromeEnabled = useComposerDraftStore((store) => store.setChromeEnabled);
   const setComposerDraftInteractionMode = useComposerDraftStore(
     (store) => store.setInteractionMode,
   );
@@ -465,6 +467,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
   const activeThread = serverThread ?? localDraftThread;
   const runtimeMode =
     composerDraft.runtimeMode ?? activeThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE;
+  const chromeEnabled = composerDraft.chromeEnabled ?? false;
   const interactionMode =
     composerDraft.interactionMode ?? activeThread?.interactionMode ?? DEFAULT_INTERACTION_MODE;
   const isServerThread = serverThread !== undefined;
@@ -657,16 +660,21 @@ export default function ChatView({ threadId }: ChatViewProps) {
     return undefined;
   }, [selectedCodexFastModeEnabled, selectedEffort, selectedProvider, supportsReasoningEffort]);
   const providerOptionsForDispatch = useMemo(() => {
-    if (!settings.codexBinaryPath && !settings.codexHomePath) {
+    const hasCodexOptions = Boolean(settings.codexBinaryPath || settings.codexHomePath);
+    const codexPart = hasCodexOptions
+      ? {
+          codex: {
+            ...(settings.codexBinaryPath ? { binaryPath: settings.codexBinaryPath } : {}),
+            ...(settings.codexHomePath ? { homePath: settings.codexHomePath } : {}),
+          },
+        }
+      : {};
+    const claudeCodePart = chromeEnabled ? { claudeCode: { chrome: true as const } } : {};
+    if (!hasCodexOptions && !chromeEnabled) {
       return undefined;
     }
-    return {
-      codex: {
-        ...(settings.codexBinaryPath ? { binaryPath: settings.codexBinaryPath } : {}),
-        ...(settings.codexHomePath ? { homePath: settings.codexHomePath } : {}),
-      },
-    };
-  }, [settings.codexBinaryPath, settings.codexHomePath]);
+    return { ...codexPart, ...claudeCodePart };
+  }, [chromeEnabled, settings.codexBinaryPath, settings.codexHomePath]);
   const selectedCursorModel = useMemo(
     () => (selectedProvider === "cursor" ? parseCursorModelSelection(selectedModel) : null),
     [selectedModel, selectedProvider],
@@ -1618,6 +1626,10 @@ export default function ChatView({ threadId }: ChatViewProps) {
       runtimeMode === "full-access" ? "approval-required" : "full-access",
     );
   }, [handleRuntimeModeChange, runtimeMode]);
+  const toggleChromeEnabled = useCallback(() => {
+    setComposerDraftChromeEnabled(threadId, !chromeEnabled);
+    scheduleComposerFocus();
+  }, [chromeEnabled, scheduleComposerFocus, setComposerDraftChromeEnabled, threadId]);
   const togglePlanSidebar = useCallback(() => {
     setPlanSidebarOpen((open) => {
       if (open) {
@@ -3923,6 +3935,8 @@ export default function ChatView({ threadId }: ChatViewProps) {
                           reasoningOptions={reasoningOptions}
                           onEffortSelect={onEffortSelect}
                           onCodexFastModeChange={onCodexFastModeChange}
+                          chromeEnabled={chromeEnabled}
+                          onToggleChromeEnabled={toggleChromeEnabled}
                           onToggleInteractionMode={toggleInteractionMode}
                           onTogglePlanSidebar={togglePlanSidebar}
                           onToggleRuntimeMode={toggleRuntimeMode}
@@ -4053,6 +4067,32 @@ export default function ChatView({ threadId }: ChatViewProps) {
                             <span className="sr-only sm:not-sr-only">
                               {runtimeMode === "full-access" ? "Full access" : "Supervised"}
                             </span>
+                          </Button>
+
+                          <Separator
+                            orientation="vertical"
+                            className="mx-0.5 hidden h-4 sm:block"
+                          />
+
+                          <Button
+                            variant="ghost"
+                            className={cn(
+                              "shrink-0 whitespace-nowrap px-2 sm:px-3",
+                              chromeEnabled
+                                ? "text-blue-400 hover:text-blue-300"
+                                : "text-muted-foreground/70 hover:text-foreground/80",
+                            )}
+                            size="sm"
+                            type="button"
+                            onClick={toggleChromeEnabled}
+                            title={
+                              chromeEnabled
+                                ? "Chrome enabled — click to disable"
+                                : "Chrome disabled — click to enable"
+                            }
+                          >
+                            <ChromeIcon />
+                            <span className="sr-only sm:not-sr-only">Chrome</span>
                           </Button>
 
                           {activePlan || activeProposedPlan || planSidebarOpen ? (
