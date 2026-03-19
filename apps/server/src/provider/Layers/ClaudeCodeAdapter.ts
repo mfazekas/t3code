@@ -29,11 +29,13 @@ import {
   type ProviderRuntimeTurnStatus,
   type ProviderSendTurnInput,
   type ProviderSession,
+  type ProviderUserInputAnswers,
   RuntimeItemId,
   RuntimeRequestId,
   RuntimeTaskId,
   ThreadId,
   TurnId,
+  type UserInputQuestion,
 } from "@t3tools/contracts";
 import { Cause, DateTime, Deferred, Effect, FileSystem, Layer, Queue, Random, Ref, Stream } from "effect";
 
@@ -85,6 +87,11 @@ interface PendingApproval {
   readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
 }
 
+interface PendingUserInput {
+  readonly questions: ReadonlyArray<UserInputQuestion>;
+  readonly answers: Deferred.Deferred<ProviderUserInputAnswers>;
+}
+
 interface ToolInFlight {
   readonly itemId: string;
   readonly itemType: CanonicalItemType;
@@ -103,6 +110,7 @@ interface ClaudeSessionContext {
   readonly startedAt: string;
   resumeSessionId: string | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
+  readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
   readonly turns: Array<{
     id: TurnId;
     items: Array<unknown>;
@@ -1796,6 +1804,11 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
         }
         context.pendingApprovals.clear();
 
+        for (const [, pending] of context.pendingUserInputs) {
+          yield* Deferred.succeed(pending.answers, {});
+        }
+        context.pendingUserInputs.clear();
+
         if (context.turnState) {
           yield* completeTurn(context, "interrupted", "Session stopped.");
         }
@@ -1872,6 +1885,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
         const prompt = buildPromptStream(promptQueue);
 
         const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
+        const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
         const inFlightTools = new Map<number, ToolInFlight>();
 
         const contextRef = yield* Ref.make<ClaudeSessionContext | undefined>(undefined);
@@ -1884,6 +1898,101 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
                 return {
                   behavior: "deny",
                   message: "Claude session context is unavailable.",
+                } satisfies PermissionResult;
+              }
+
+              // AskUserQuestion: always handled regardless of permission mode.
+              // The SDK calls canUseTool as the mechanism to collect user answers;
+              // we block here, show the UI, and return the answers via updatedInput.
+              if (toolName === "AskUserQuestion") {
+                const requestId = ApprovalRequestId.makeUnsafe(yield* Random.nextUUIDv4);
+                const answersDeferred = yield* Deferred.make<ProviderUserInputAnswers>();
+
+                // Parse questions from the tool input into canonical UserInputQuestion shape.
+                const rawQuestions = Array.isArray(toolInput["questions"])
+                  ? (toolInput["questions"] as Array<Record<string, unknown>>)
+                  : [];
+                const questions: ReadonlyArray<UserInputQuestion> = rawQuestions.map((q, idx) => ({
+                  id: String(idx),
+                  header: typeof q["header"] === "string" ? q["header"] : "",
+                  question: typeof q["question"] === "string" ? q["question"] : "",
+                  options: Array.isArray(q["options"])
+                    ? (q["options"] as Array<Record<string, unknown>>).map((o) => ({
+                        label: typeof o["label"] === "string" ? o["label"] : "",
+                        description: typeof o["description"] === "string" ? o["description"] : "",
+                      }))
+                    : [],
+                }));
+
+                const requestedStamp = yield* makeEventStamp();
+                yield* offerRuntimeEvent({
+                  type: "user-input.requested",
+                  eventId: requestedStamp.eventId,
+                  provider: PROVIDER,
+                  createdAt: requestedStamp.createdAt,
+                  threadId: context.session.threadId,
+                  ...(context.turnState
+                    ? { turnId: asCanonicalTurnId(context.turnState.turnId) }
+                    : {}),
+                  requestId: asRuntimeRequestId(requestId),
+                  payload: { questions },
+                  providerRefs: {
+                    ...providerThreadRef(context),
+                    ...(context.turnState
+                      ? { providerTurnId: String(context.turnState.turnId) }
+                      : {}),
+                    providerRequestId: requestId,
+                  },
+                  raw: {
+                    source: "claude.sdk.permission",
+                    method: "canUseTool/AskUserQuestion",
+                    payload: { toolName, input: toolInput },
+                  },
+                });
+
+                context.pendingUserInputs.set(requestId, { questions, answers: answersDeferred });
+
+                const onAbort = () => {
+                  if (!context.pendingUserInputs.has(requestId)) return;
+                  context.pendingUserInputs.delete(requestId);
+                  Effect.runFork(Deferred.succeed(answersDeferred, {}));
+                };
+                callbackOptions.signal.addEventListener("abort", onAbort, { once: true });
+
+                const answers = yield* Deferred.await(answersDeferred);
+                context.pendingUserInputs.delete(requestId);
+
+                const resolvedStamp = yield* makeEventStamp();
+                yield* offerRuntimeEvent({
+                  type: "user-input.resolved",
+                  eventId: resolvedStamp.eventId,
+                  provider: PROVIDER,
+                  createdAt: resolvedStamp.createdAt,
+                  threadId: context.session.threadId,
+                  ...(context.turnState
+                    ? { turnId: asCanonicalTurnId(context.turnState.turnId) }
+                    : {}),
+                  requestId: asRuntimeRequestId(requestId),
+                  payload: { answers },
+                  providerRefs: {
+                    ...providerThreadRef(context),
+                    ...(context.turnState
+                      ? { providerTurnId: String(context.turnState.turnId) }
+                      : {}),
+                    providerRequestId: requestId,
+                  },
+                  raw: {
+                    source: "claude.sdk.permission",
+                    method: "canUseTool/AskUserQuestion/resolved",
+                    payload: { answers },
+                  },
+                });
+
+                // Return allow; the SDK uses updatedInput as the AskUserQuestionOutput
+                // passed back to Claude as the tool result.
+                return {
+                  behavior: "allow",
+                  updatedInput: answers,
                 } satisfies PermissionResult;
               }
 
@@ -2100,6 +2209,7 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
           startedAt,
           resumeSessionId: resumeState?.resume,
           pendingApprovals,
+          pendingUserInputs,
           turns: [],
           inFlightTools,
           turnState: undefined,
@@ -2331,15 +2441,21 @@ function makeClaudeCodeAdapter(options?: ClaudeCodeAdapterLiveOptions) {
     const respondToUserInput: ClaudeCodeAdapterShape["respondToUserInput"] = (
       threadId,
       requestId,
-      _answers,
+      answers,
     ) =>
-      Effect.fail(
-        new ProviderAdapterRequestError({
-          provider: PROVIDER,
-          method: "item/tool/requestUserInput",
-          detail: `Claude Code does not yet support structured user-input responses for thread '${threadId}' and request '${requestId}'.`,
-        }),
-      );
+      Effect.gen(function* () {
+        const context = yield* requireSession(threadId);
+        const pending = context.pendingUserInputs.get(requestId);
+        if (!pending) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "item/tool/requestUserInput",
+            detail: `Unknown pending user-input request '${requestId}' for thread '${threadId}'.`,
+          });
+        }
+        context.pendingUserInputs.delete(requestId);
+        yield* Deferred.succeed(pending.answers, answers);
+      });
 
     const stopSession: ClaudeCodeAdapterShape["stopSession"] = (threadId) =>
       Effect.gen(function* () {
