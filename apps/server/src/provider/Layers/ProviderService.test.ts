@@ -52,7 +52,7 @@ const asTurnId = (value: string): TurnId => TurnId.makeUnsafe(value);
 type LegacyProviderRuntimeEvent = {
   readonly type: string;
   readonly eventId: EventId;
-  readonly provider: "codex";
+  readonly provider: "codex" | "claudeCode" | "cursor";
   readonly createdAt: string;
   readonly threadId: ThreadId;
   readonly turnId?: string | undefined;
@@ -217,12 +217,15 @@ const sleep = (ms: number) =>
 
 function makeProviderServiceLayer() {
   const codex = makeFakeCodexAdapter();
+  const claude = makeFakeCodexAdapter("claudeCode");
   const registry: typeof ProviderAdapterRegistry.Service = {
     getByProvider: (provider) =>
       provider === "codex"
         ? Effect.succeed(codex.adapter)
-        : Effect.fail(new ProviderUnsupportedError({ provider })),
-    listProviders: () => Effect.succeed(["codex"]),
+        : provider === "claudeCode"
+          ? Effect.succeed(claude.adapter)
+          : Effect.fail(new ProviderUnsupportedError({ provider })),
+    listProviders: () => Effect.succeed(["codex", "claudeCode"]),
   };
 
   const providerAdapterLayer = Layer.succeed(ProviderAdapterRegistry, registry);
@@ -247,6 +250,7 @@ function makeProviderServiceLayer() {
 
   return {
     codex,
+    claude,
     layer,
   };
 }
@@ -533,6 +537,29 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("routes explicit claudeCode provider session starts to the claude adapter", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService;
+
+      const session = yield* provider.startSession(asThreadId("thread-claude"), {
+        provider: "claudeCode",
+        threadId: asThreadId("thread-claude"),
+        cwd: "/tmp/project-claude",
+        runtimeMode: "full-access",
+      });
+
+      assert.equal(session.provider, "claudeCode");
+      assert.equal(routing.claude.startSession.mock.calls.length, 1);
+      const startInput = routing.claude.startSession.mock.calls[0]?.[0];
+      assert.equal(typeof startInput === "object" && startInput !== null, true);
+      if (startInput && typeof startInput === "object") {
+        const startPayload = startInput as { provider?: string; cwd?: string };
+        assert.equal(startPayload.provider, "claudeCode");
+        assert.equal(startPayload.cwd, "/tmp/project-claude");
+      }
+    }),
+  );
+
   it.effect("recovers stale sessions for sendTurn using persisted cwd", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService;
@@ -589,6 +616,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       });
 
       yield* routing.codex.stopAll();
+      yield* routing.claude.stopAll();
 
       const remaining = yield* provider.listSessions();
       assert.equal(remaining.length, 0);
@@ -635,7 +663,6 @@ routing.layer("ProviderServiceLive routing", (it) => {
           assert.equal(runtimePayload.lastRuntimeEvent, "provider.sendTurn");
         }
       }
-
     }),
   );
 });
@@ -704,7 +731,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         threadId: session.threadId,
         turnId: asTurnId("turn-1"),
         toolKind: "command",
-        title: "Command run",
+        title: "Ran command",
       });
       fanout.codex.emit({
         type: "tool.completed",
@@ -714,7 +741,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         threadId: session.threadId,
         turnId: asTurnId("turn-1"),
         toolKind: "command",
-        title: "Command run",
+        title: "Ran command",
       });
       fanout.codex.emit({
         type: "turn.completed",
@@ -769,7 +796,7 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
           threadId: session.threadId,
           turnId: asTurnId("turn-1"),
           toolKind: "command",
-          title: "Command run",
+          title: "Ran command",
           detail: "echo one",
         },
         {

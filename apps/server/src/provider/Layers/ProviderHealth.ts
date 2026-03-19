@@ -8,12 +8,13 @@
  *
  * @module ProviderHealthLive
  */
+import * as OS from "node:os";
 import type {
   ServerProviderAuthStatus,
   ServerProviderStatus,
   ServerProviderStatusState,
 } from "@t3tools/contracts";
-import { Effect, Layer, Option, Result, Stream } from "effect";
+import { Array, Effect, Fiber, FileSystem, Layer, Option, Path, Result, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import {
@@ -25,6 +26,7 @@ import { ProviderHealth, type ProviderHealthShape } from "../Services/ProviderHe
 
 const DEFAULT_TIMEOUT_MS = 4_000;
 const CODEX_PROVIDER = "codex" as const;
+const CLAUDE_CODE_PROVIDER = "claudeCode" as const;
 
 // ── Pure helpers ────────────────────────────────────────────────────
 
@@ -167,6 +169,72 @@ export function parseAuthStatusFromOutput(result: CommandResult): {
   };
 }
 
+// ── Codex CLI config detection ──────────────────────────────────────
+
+/**
+ * Providers that use OpenAI-native authentication via `codex login`.
+ * When the configured `model_provider` is one of these, the `codex login
+ * status` probe still runs. For any other provider value the auth probe
+ * is skipped because authentication is handled externally (e.g. via
+ * environment variables like `PORTKEY_API_KEY` or `AZURE_API_KEY`).
+ */
+const OPENAI_AUTH_PROVIDERS = new Set(["openai"]);
+
+/**
+ * Read the `model_provider` value from the Codex CLI config file.
+ *
+ * Looks for the file at `$CODEX_HOME/config.toml` (falls back to
+ * `~/.codex/config.toml`). Uses a simple line-by-line scan rather than
+ * a full TOML parser to avoid adding a dependency for a single key.
+ *
+ * Returns `undefined` when the file does not exist or does not set
+ * `model_provider`.
+ */
+export const readCodexConfigModelProvider = Effect.gen(function* () {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const codexHome = process.env.CODEX_HOME || path.join(OS.homedir(), ".codex");
+  const configPath = path.join(codexHome, "config.toml");
+
+  const content = yield* fileSystem
+    .readFileString(configPath)
+    .pipe(Effect.orElseSucceed(() => undefined));
+  if (content === undefined) {
+    return undefined;
+  }
+
+  // We need to find `model_provider = "..."` at the top level of the
+  // TOML file (i.e. before any `[section]` header). Lines inside
+  // `[profiles.*]`, `[model_providers.*]`, etc. are ignored.
+  let inTopLevel = true;
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    // Skip comments and empty lines.
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    // Detect section headers — once we leave the top level, stop.
+    if (trimmed.startsWith("[")) {
+      inTopLevel = false;
+      continue;
+    }
+    if (!inTopLevel) continue;
+
+    const match = trimmed.match(/^model_provider\s*=\s*["']([^"']+)["']/);
+    if (match) return match[1];
+  }
+  return undefined;
+});
+
+/**
+ * Returns `true` when the Codex CLI is configured with a custom
+ * (non-OpenAI) model provider, meaning `codex login` auth is not
+ * required because authentication is handled through provider-specific
+ * environment variables.
+ */
+export const hasCustomModelProvider = Effect.map(
+  readCodexConfigModelProvider,
+  (provider) => provider !== undefined && !OPENAI_AUTH_PROVIDERS.has(provider),
+);
+
 // ── Effect-native command execution ─────────────────────────────────
 
 const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.Effect<string, E> =>
@@ -176,10 +244,10 @@ const collectStreamAsString = <E>(stream: Stream.Stream<Uint8Array, E>): Effect.
     (acc, chunk) => acc + new TextDecoder().decode(chunk),
   );
 
-const runCodexCommand = (args: ReadonlyArray<string>) =>
+const runCliCommand = (binary: string, args: ReadonlyArray<string>) =>
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const command = ChildProcess.make("codex", [...args], {
+    const command = ChildProcess.make(binary, [...args], {
       shell: process.platform === "win32",
     });
 
@@ -197,12 +265,15 @@ const runCodexCommand = (args: ReadonlyArray<string>) =>
     return { stdout, stderr, code: exitCode } satisfies CommandResult;
   }).pipe(Effect.scoped);
 
+const runCodexCommand = (args: ReadonlyArray<string>) => runCliCommand("codex", args);
+const runClaudeCommand = (args: ReadonlyArray<string>) => runCliCommand("claude", args);
+
 // ── Health check ────────────────────────────────────────────────────
 
 export const checkCodexProviderStatus: Effect.Effect<
   ServerProviderStatus,
   never,
-  ChildProcessSpawner.ChildProcessSpawner
+  ChildProcessSpawner.ChildProcessSpawner | FileSystem.FileSystem | Path.Path
 > = Effect.gen(function* () {
   const checkedAt = new Date().toISOString();
 
@@ -265,6 +336,22 @@ export const checkCodexProviderStatus: Effect.Effect<
   }
 
   // Probe 2: `codex login status` — is the user authenticated?
+  //
+  // Custom model providers (e.g. Portkey, Azure OpenAI proxy) handle
+  // authentication through their own environment variables, so `codex
+  // login status` will report "not logged in" even when the CLI works
+  // fine.  Skip the auth probe entirely for non-OpenAI providers.
+  if (yield* hasCustomModelProvider) {
+    return {
+      provider: CODEX_PROVIDER,
+      status: "ready" as const,
+      available: true,
+      authStatus: "unknown" as const,
+      checkedAt,
+      message: "Using a custom Codex model provider; OpenAI login check skipped.",
+    } satisfies ServerProviderStatus;
+  }
+
   const authProbe = yield* runCodexCommand(["login", "status"]).pipe(
     Effect.timeoutOption(DEFAULT_TIMEOUT_MS),
     Effect.result,
@@ -307,14 +394,94 @@ export const checkCodexProviderStatus: Effect.Effect<
   } satisfies ServerProviderStatus;
 });
 
+// ── Claude Code health check ────────────────────────────────────────
+
+function isClaudeCommandMissingCause(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const lower = error.message.toLowerCase();
+  return (
+    lower.includes("command not found: claude") ||
+    lower.includes("spawn claude enoent") ||
+    lower.includes("enoent") ||
+    lower.includes("notfound")
+  );
+}
+
+export const checkClaudeCodeProviderStatus: Effect.Effect<
+  ServerProviderStatus,
+  never,
+  ChildProcessSpawner.ChildProcessSpawner
+> = Effect.gen(function* () {
+  const checkedAt = new Date().toISOString();
+
+  // Probe: `claude --version` — is the CLI reachable?
+  const versionProbe = yield* runClaudeCommand(["--version"]).pipe(
+    Effect.timeoutOption(DEFAULT_TIMEOUT_MS),
+    Effect.result,
+  );
+
+  if (Result.isFailure(versionProbe)) {
+    const error = versionProbe.failure;
+    return {
+      provider: CLAUDE_CODE_PROVIDER,
+      status: "error" as const,
+      available: false,
+      authStatus: "unknown" as const,
+      checkedAt,
+      message: isClaudeCommandMissingCause(error)
+        ? "Claude Code CLI (`claude`) is not installed or not on PATH."
+        : `Failed to execute Claude Code CLI health check: ${error instanceof Error ? error.message : String(error)}.`,
+    };
+  }
+
+  if (Option.isNone(versionProbe.success)) {
+    return {
+      provider: CLAUDE_CODE_PROVIDER,
+      status: "error" as const,
+      available: false,
+      authStatus: "unknown" as const,
+      checkedAt,
+      message: "Claude Code CLI timed out while running `claude --version`.",
+    };
+  }
+
+  const version = versionProbe.success.value;
+  if (version.code !== 0) {
+    const detail = detailFromResult(version);
+    return {
+      provider: CLAUDE_CODE_PROVIDER,
+      status: "error" as const,
+      available: false,
+      authStatus: "unknown" as const,
+      checkedAt,
+      message: detail
+        ? `Claude Code CLI is installed but failed to run. ${detail}`
+        : "Claude Code CLI is installed but failed to run.",
+    };
+  }
+
+  // Claude Code SDK-based adapter handles auth at session time,
+  // so we mark as ready/authenticated if the CLI is reachable.
+  return {
+    provider: CLAUDE_CODE_PROVIDER,
+    status: "ready" as const,
+    available: true,
+    authStatus: "authenticated" as const,
+    checkedAt,
+  } satisfies ServerProviderStatus;
+});
+
 // ── Layer ───────────────────────────────────────────────────────────
 
 export const ProviderHealthLive = Layer.effect(
   ProviderHealth,
   Effect.gen(function* () {
-    const codexStatus = yield* checkCodexProviderStatus;
+    const [codexStatus, claudeCodeStatus] = yield* Effect.all(
+      [checkCodexProviderStatus, checkClaudeCodeProviderStatus],
+      { concurrency: "unbounded" },
+    );
     return {
-      getStatuses: Effect.succeed([codexStatus]),
+      getStatuses: Effect.succeed([codexStatus, claudeCodeStatus]),
     } satisfies ProviderHealthShape;
   }),
 );

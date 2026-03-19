@@ -78,9 +78,8 @@ interface AttachmentSideEffects {
 }
 
 const materializeAttachmentsForProjection = Effect.fn(
-  (input: {
-    readonly attachments: ReadonlyArray<ChatAttachment>;
-  }) => Effect.succeed(input.attachments.length === 0 ? [] : input.attachments),
+  (input: { readonly attachments: ReadonlyArray<ChatAttachment> }) =>
+    Effect.succeed(input.attachments.length === 0 ? [] : input.attachments),
 );
 
 function extractActivityRequestId(payload: unknown): ApprovalRequestId | null {
@@ -336,7 +335,6 @@ const runAttachmentSideEffects = Effect.fn(function* (sideEffects: AttachmentSid
     },
     { concurrency: 1 },
   );
-
 });
 
 const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
@@ -655,6 +653,8 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
             threadId: event.payload.threadId,
             turnId: event.payload.proposedPlan.turnId,
             planMarkdown: event.payload.proposedPlan.planMarkdown,
+            implementedAt: event.payload.proposedPlan.implementedAt,
+            implementationThreadId: event.payload.proposedPlan.implementationThreadId,
             createdAt: event.payload.proposedPlan.createdAt,
             updatedAt: event.payload.proposedPlan.updatedAt,
           });
@@ -760,6 +760,7 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
         threadId: event.payload.threadId,
         status: event.payload.session.status,
         providerName: event.payload.session.providerName,
+        providerThreadId: event.payload.session.providerThreadId ?? null,
         runtimeMode: event.payload.session.runtimeMode,
         activeTurnId: event.payload.session.activeTurnId,
         lastError: event.payload.session.lastError,
@@ -777,6 +778,8 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
           yield* projectionTurnRepository.replacePendingTurnStart({
             threadId: event.payload.threadId,
             messageId: event.payload.messageId,
+            sourceProposedPlanThreadId: event.payload.sourceProposedPlan?.threadId ?? null,
+            sourceProposedPlanId: event.payload.sourceProposedPlan?.planId ?? null,
             requestedAt: event.payload.createdAt,
           });
           return;
