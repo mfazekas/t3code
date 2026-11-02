@@ -153,12 +153,16 @@ it.effect(
         requestId: RuntimeRequestId.make("child"),
         decision: "decline",
         feedback,
+        respondedBy: { via: "mcp", clientSessionId: "session-1", clientLabel: "Claude" },
       });
       const projection = yield* projections.getThreadProjection(threadId);
-      assert.equal(
-        projection.runtimeRequests.find((request) => request.id === "child")?.feedback,
-        feedback,
-      );
+      const resolved = projection.runtimeRequests.find((request) => request.id === "child");
+      assert.equal(resolved?.feedback, feedback);
+      assert.deepEqual(resolved?.respondedBy, {
+        via: "mcp",
+        clientSessionId: "session-1",
+        clientLabel: "Claude",
+      });
       assert.equal(
         projection.runtimeRequests.find((request) => request.id === "other")?.status,
         "pending",

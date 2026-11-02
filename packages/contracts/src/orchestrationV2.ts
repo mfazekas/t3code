@@ -8,6 +8,7 @@ import * as SchemaGetter from "effect/SchemaGetter";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
+  AuthSessionId,
   CheckpointId,
   CheckpointRef,
   CheckpointScopeId,
@@ -41,7 +42,7 @@ import {
   TrimmedNonEmptyString,
   TurnItemId,
 } from "./baseSchemas.ts";
-import { AuthMcpClientAccess } from "./auth.ts";
+import { AuthMcpClientAccess, ServerAuthSessionMethod } from "./auth.ts";
 import { ChatAttachment } from "./chatAttachment.ts";
 import { ThreadGuestShare } from "./guestShare.ts";
 import { StoredThreadTags, ThreadTag } from "./threadTags.ts";
@@ -1200,6 +1201,26 @@ export function latestProviderTurnForAttempt<
   return latest;
 }
 
+/**
+ * Who answered a runtime request, set only by the server. A paired client may be a browser,
+ * an app, or a script holding a token; the server cannot tell those apart.
+ */
+export const OrchestrationV2RuntimeRequestResponder = Schema.Union([
+  Schema.Struct({
+    via: Schema.Literal("client"),
+    authSessionId: AuthSessionId,
+    authMethod: ServerAuthSessionMethod,
+  }),
+  Schema.Struct({
+    via: Schema.Literal("mcp"),
+    callerThreadId: Schema.optional(ThreadId),
+    clientSessionId: Schema.optional(Schema.String),
+    clientLabel: Schema.optional(Schema.String),
+  }),
+]);
+export type OrchestrationV2RuntimeRequestResponder =
+  typeof OrchestrationV2RuntimeRequestResponder.Type;
+
 export const OrchestrationV2RuntimeRequest = Schema.Struct({
   id: RuntimeRequestId,
   nodeId: NodeId,
@@ -1224,6 +1245,7 @@ export const OrchestrationV2RuntimeRequest = Schema.Struct({
   decision: Schema.optional(ProviderApprovalDecision),
   feedback: Schema.optional(Schema.String),
   answers: Schema.optional(ProviderUserInputAnswers),
+  respondedBy: Schema.optional(OrchestrationV2RuntimeRequestResponder),
 });
 export type OrchestrationV2RuntimeRequest = typeof OrchestrationV2RuntimeRequest.Type;
 
@@ -3279,6 +3301,8 @@ export const OrchestrationV2Command = Schema.Union([
     feedback: Schema.optional(Schema.String),
     answers: Schema.optional(ProviderUserInputAnswers),
     attachmentsByQuestionId: Schema.optional(UserInputAttachments),
+    /** Set by the server where the command enters; a value a client sends is replaced. */
+    respondedBy: Schema.optional(OrchestrationV2RuntimeRequestResponder),
   }),
   Schema.Struct({
     type: Schema.Literal("thread.user-input.dismiss"),

@@ -9051,6 +9051,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(command.decision === undefined ? {} : { decision: command.decision }),
         ...(command.feedback === undefined ? {} : { feedback: command.feedback }),
         ...(answers === undefined ? {} : { answers }),
+        ...(command.respondedBy === undefined ? {} : { respondedBy: command.respondedBy }),
       };
       const emitEvent = emit(events, command);
       const requestNode = context.node;

@@ -1261,6 +1261,21 @@ export const subscribeOrchestrationV2Shell = Effect.fn("ws.orchestrationV2.subsc
   },
 );
 
+/** A paired client's answer records its session; what the client claims is replaced. */
+export const clientResponder =
+  (currentSession: EnvironmentAuth.AuthenticatedSession) =>
+  <C extends OrchestrationV2Command>(command: C): C =>
+    command.type === "runtime-request.respond"
+      ? {
+          ...command,
+          respondedBy: {
+            via: "client",
+            authSessionId: currentSession.sessionId,
+            authMethod: currentSession.method,
+          },
+        }
+      : command;
+
 export const layerWsRpc = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
@@ -1270,6 +1285,7 @@ export const layerWsRpc = (
   Layer.effectContext(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
+      const withClientResponder = clientResponder(currentSession);
       const sql = yield* SqlClient.SqlClient;
       const threadManagement = yield* ThreadManagementService.ThreadManagementService;
       const intakeContext = yield* Effect.context<
@@ -1936,11 +1952,14 @@ export const layerWsRpc = (
                   (command.type === "prepared-run.retry"
                     ? threadLaunch.retryPreparation(command)
                     : ThreadMessageIntake.dispatchCommand(
-                        ThreadManagementService.withCreationProvenance(command, {
-                          createdBy: "user",
-                          creationSource:
-                            "creationSource" in command ? command.creationSource : "web",
-                        }),
+                        ThreadManagementService.withCreationProvenance(
+                          withClientResponder(command),
+                          {
+                            createdBy: "user",
+                            creationSource:
+                              "creationSource" in command ? command.creationSource : "web",
+                          },
+                        ),
                       )
                   ).pipe(Effect.provide(intakeContext)),
                 )

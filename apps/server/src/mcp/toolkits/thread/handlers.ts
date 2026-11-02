@@ -2,18 +2,24 @@ import {
   type CommandId,
   type RuntimeRequestId,
   ThreadId,
+  type OrchestrationV2RuntimeRequestResponder,
   type OrchestrationV2ThreadProjection,
+  type ProviderApprovalDecision,
+  ProviderRequestKind,
   type RunId,
   OrchestratorMcpFailure,
   type OrchestrationV2Command,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import { modelSelectionCommandType } from "@t3tools/shared/model";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import {
+  assertFullAccess,
   dispatchFailure,
+  loadCaller,
   newCommandId,
   readCaller,
   readThread,
@@ -22,6 +28,7 @@ import {
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import { ThreadToolkit } from "./tools.ts";
 
 function queueEntry(
@@ -50,31 +57,97 @@ const dispatch = Effect.fn("mcp.dispatchThreadCommand")(function* (
   return { sequence: result.sequence };
 });
 
-const readQuestion = Effect.fn("mcp.readQuestion")(function* (input: {
+type RuntimeRequest = OrchestrationV2ThreadProjection["runtimeRequests"][number];
+const isApprovalKind = Schema.is(ProviderRequestKind);
+const isApprovalRequest = (request: RuntimeRequest) => isApprovalKind(request.kind);
+const isPendingRequest = (request: RuntimeRequest) =>
+  request.status === "pending" && (request.kind === "user_input" || isApprovalRequest(request));
+const DEFAULT_APPROVAL_DECISIONS: ReadonlyArray<ProviderApprovalDecision> = [
+  "cancel",
+  "decline",
+  "acceptForSession",
+  "accept",
+];
+const APPROVAL_PROMPT_LIMIT = 4000;
+
+const readPendingRequest = Effect.fn("mcp.readPendingRequest")(function* (input: {
   threadId?: ThreadId | undefined;
   requestId: RuntimeRequestId;
 }) {
   const context = yield* readThread(input.threadId, ["runtimeRequests", "turnItems"]);
   const request = context.projection.runtimeRequests.find(
-    (request) => request.id === input.requestId && request.kind === "user_input",
+    (request) =>
+      request.id === input.requestId &&
+      (request.kind === "user_input" || isApprovalRequest(request)),
   );
   const item = context.projection.turnItems.find(
-    (item) => item.type === "user_input_request" && item.requestId === input.requestId,
+    (item) =>
+      (item.type === "user_input_request" || item.type === "approval_request") &&
+      item.requestId === input.requestId,
   );
-  if (request === undefined || item?.type !== "user_input_request")
+  if (
+    request === undefined ||
+    (request.kind === "user_input"
+      ? item?.type !== "user_input_request"
+      : item?.type !== "approval_request")
+  )
     return yield* new OrchestratorMcpFailure({
       code: "invalid_request",
-      message: "The pending user-input request was not found.",
+      message: "The pending request was not found.",
     });
   if (request.status !== "pending")
     return yield* new OrchestratorMcpFailure({
       code: "invalid_request",
       message:
         request.status === "resolved"
-          ? "The user-input request was already answered."
-          : `The user-input request is no longer pending (${request.status}).`,
+          ? "The request was already answered."
+          : `The request is no longer pending (${request.status}).`,
     });
   return { ...context, request, item };
+});
+
+const mcpResponder = Effect.fn("mcp.responder")(function* () {
+  const scope = yield* McpInvocationContext.McpInvocationContext;
+  return {
+    via: "mcp",
+    ...(scope.thread === undefined ? {} : { callerThreadId: scope.thread.threadId }),
+    ...(scope.client === undefined
+      ? {}
+      : { clientSessionId: scope.client.sessionId, clientLabel: scope.client.label }),
+  } satisfies OrchestrationV2RuntimeRequestResponder;
+});
+
+/** Answering an approval is opt-in per environment; approving also needs a full-access caller. */
+const approvalDecision = Effect.fn("mcp.approvalDecision")(function* (
+  decision: ProviderApprovalDecision | undefined,
+  offered: ReadonlyArray<ProviderApprovalDecision> | undefined,
+) {
+  const settings = yield* ServerSettings.ServerSettingsService.pipe(
+    Effect.flatMap((service) => service.getSettings),
+    Effect.mapError(unavailable),
+  );
+  if (!settings.allowMcpApprovalResponses)
+    return yield* new OrchestratorMcpFailure({
+      code: "capability_denied",
+      message:
+        "Answering permission requests over MCP is off. The user can turn it on in Settings; until then ask them to answer in T3 Code.",
+    });
+  if (decision === undefined)
+    return yield* new OrchestratorMcpFailure({
+      code: "invalid_request",
+      message: "An approval needs a `decision`.",
+    });
+  if (!(offered ?? DEFAULT_APPROVAL_DECISIONS).includes(decision))
+    return yield* new OrchestratorMcpFailure({
+      code: "invalid_request",
+      message: "That decision was not offered for this approval.",
+    });
+  if (decision !== "decline" && decision !== "cancel")
+    yield* assertFullAccess(
+      yield* loadCaller(),
+      "Approving needs a live full-access thread or a full-access client.",
+    );
+  return decision;
 });
 /** A field the chosen action needs. `null` counts as given, as in `beforeRunId: null`. */
 const required = <A>(value: A | undefined, name: string) =>
@@ -232,32 +305,65 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
       Effect.gen(function* () {
         if (input.action === "list") {
           const { projection } = yield* readThread(input.threadId, ["runtimeRequests"]);
+          const pending = projection.runtimeRequests.filter(isPendingRequest);
           return {
-            requestIds: projection.runtimeRequests
-              .filter((request) => request.kind === "user_input" && request.status === "pending")
+            requestIds: pending
+              .filter((request) => request.kind === "user_input")
               .map((request) => request.id),
+            approvals: pending
+              .filter(isApprovalRequest)
+              .map((request) => ({ requestId: request.id, kind: request.kind })),
           };
         }
         const requestId = yield* required(input.requestId, "requestId");
-        const { item } = yield* readQuestion({ threadId: input.threadId, requestId });
-        return { requestId, questions: item.questions };
+        const { request, item } = yield* readPendingRequest({
+          threadId: input.threadId,
+          requestId,
+        });
+        if (item?.type === "user_input_request") return { requestId, questions: item.questions };
+        const approval = item?.type === "approval_request" ? item : undefined;
+        const prompt = approval?.prompt === undefined ? undefined : Array.from(approval.prompt);
+        return {
+          requestId,
+          kind: request.kind,
+          ...(prompt === undefined
+            ? {}
+            : { prompt: prompt.slice(0, APPROVAL_PROMPT_LIMIT).join("") }),
+          ...(prompt !== undefined && prompt.length > APPROVAL_PROMPT_LIMIT
+            ? { promptTruncated: true }
+            : {}),
+          ...(approval?.reason === undefined ? {} : { reason: approval.reason }),
+          ...(approval?.appName === undefined ? {} : { appName: approval.appName }),
+          ...(approval?.options === undefined ? {} : { options: approval.options }),
+        };
       }),
     ),
     writesThread((input) =>
       Effect.gen(function* () {
         const requestId = yield* required(input.requestId, "requestId");
-        const answers = yield* required(input.answers, "answers");
-        const { threads, projection } = yield* readQuestion({
+        const { threads, projection, request, item } = yield* readPendingRequest({
           threadId: input.threadId,
           requestId,
         });
+        const response =
+          request.kind === "user_input"
+            ? { answers: yield* required(input.answers, "answers") }
+            : {
+                decision: yield* approvalDecision(
+                  input.decision,
+                  item?.type === "approval_request"
+                    ? item.options?.map((option) => option.decision)
+                    : undefined,
+                ),
+              };
         const result = yield* threads
           .dispatch({
             type: "runtime-request.respond",
             threadId: projection.thread.id,
             commandId: yield* newCommandId(),
             requestId,
-            answers,
+            ...response,
+            respondedBy: yield* mcpResponder(),
           })
           .pipe(Effect.mapError(dispatchFailure));
         return { sequence: result.sequence };

@@ -1,7 +1,7 @@
 import * as DocumentText from "../../provider/DocumentText.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { expect, it } from "@effect/vitest";
+import { describe, expect, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
   ChatImageAttachment,
@@ -22,6 +22,7 @@ import {
 } from "@t3tools/contracts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as Deferred from "effect/Deferred";
+import * as Ref from "effect/Ref";
 import * as Effect from "effect/Effect";
 import * as TestClock from "effect/testing/TestClock";
 import * as Layer from "effect/Layer";
@@ -81,6 +82,7 @@ const layerThreadToolkit = McpHttpServer.layerThreadToolkit.pipe(
   Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
   Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
   Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+  Layer.provide(ServerSettings.layerTest()),
 );
 
 const threadId = ThreadId.make("mcp-core-thread");
@@ -154,11 +156,11 @@ it.effect("an answered question reports already answered instead of not found", 
         );
     expect(declaredFailure(yield* respond(requestId))).toMatchObject({
       code: "invalid_request",
-      message: "The user-input request was already answered.",
+      message: "The request was already answered.",
     });
     expect(declaredFailure(yield* respond("missing-question"))).toMatchObject({
       code: "invalid_request",
-      message: "The pending user-input request was not found.",
+      message: "The pending request was not found.",
     });
   }).pipe(
     Effect.provide(
@@ -763,6 +765,7 @@ it.effect.each([
       McpHttpServer.layerThreadToolkit.pipe(
         Layer.provideMerge(McpServer.McpServer.layer),
         Layer.provide(NodeCrypto.layer),
+        Layer.provide(ServerSettings.layerTest()),
         Layer.provide(Layer.mock(ThreadManagement.ThreadManagementService)({})),
         Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
         Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
@@ -1070,3 +1073,167 @@ it.effect(
     );
   },
 );
+
+describe("approvals over MCP", () => {
+  const shell = McpToolAccessTestkit.liveThreadShell(threadId, { runtimeMode: "auto" });
+  const requestId = RuntimeRequestId.make("pending-approval");
+  const approvalProjection = {
+    ...McpToolAccessTestkit.idleThreadProjection(shell),
+    runtimeRequests: [
+      {
+        id: requestId,
+        nodeId: NodeId.make("root"),
+        providerTurnId: null,
+        nativeRequestRef: null,
+        kind: "command" as const,
+        status: "pending" as const,
+        responseCapability: { type: "message" as const },
+        createdAt: shell.createdAt,
+        resolvedAt: null,
+      },
+    ],
+    turnItems: [
+      {
+        id: TurnItemId.make("pending-approval-item"),
+        threadId,
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 0,
+        status: "inProgress" as const,
+        title: null,
+        startedAt: shell.createdAt,
+        completedAt: null,
+        updatedAt: shell.updatedAt,
+        type: "approval_request" as const,
+        requestId,
+        requestKind: "command" as const,
+        prompt: "rm -r build",
+        reason: "Dangerous rm",
+        options: [
+          { decision: "accept" as const, label: "Approve" },
+          { decision: "decline" as const, label: "Decline" },
+        ],
+      },
+    ],
+  };
+
+  const withApprovals = (
+    allowMcpApprovalResponses: boolean,
+    access: McpInvocationContext.McpClientCaller["access"],
+    test: (
+      call: (
+        args: Record<string, unknown>,
+      ) => Effect.Effect<
+        McpSchema.CallToolResult,
+        McpSchema.InternalError | McpSchema.InvalidParams
+      >,
+      dispatched: () => Effect.Effect<ReadonlyArray<unknown>>,
+    ) => Effect.Effect<void, McpSchema.InternalError | McpSchema.InvalidParams>,
+  ) =>
+    Effect.gen(function* () {
+      const commands = yield* Ref.make<ReadonlyArray<unknown>>([]);
+      const layer = McpHttpServer.layerThreadToolkit.pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(ServerSettings.layerTest({ allowMcpApprovalResponses })),
+        Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
+        Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
+        Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
+        Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
+        Layer.provide(Layer.mock(PeerLinks.PeerLinks)({})),
+        Layer.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getThreadShell: () => Effect.succeed(shell),
+            getProjectThreadRecords: () => Effect.succeed(approvalProjection as never),
+            dispatch: (command) =>
+              Ref.update(commands, (all) => [...all, command]).pipe(
+                Effect.as({ sequence: 1, storedEvents: [] }),
+              ),
+          }),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        yield* test(
+          (args) =>
+            server
+              .callTool({ name: "t3_pending_request", arguments: { threadId, ...args } })
+              .pipe(
+                Effect.provideService(
+                  McpInvocationContext.McpInvocationContext,
+                  clientScope(access),
+                ),
+                Effect.provideService(McpSchema.McpServerClient, client),
+              ),
+          () => Ref.get(commands),
+        );
+      }).pipe(Effect.provide(layer));
+    });
+
+  it.effect("lists and reads an approval even while responding is off", () =>
+    withApprovals(false, "full-access", (call, dispatched) =>
+      Effect.gen(function* () {
+        expect((yield* call({ action: "list" })).structuredContent).toEqual({
+          requestIds: [],
+          approvals: [{ requestId, kind: "command" }],
+        });
+        expect((yield* call({ action: "read", requestId })).structuredContent).toMatchObject({
+          requestId,
+          kind: "command",
+          prompt: "rm -r build",
+          reason: "Dangerous rm",
+        });
+        const denied = yield* call({ action: "respond", requestId, decision: "accept" });
+        expect(declaredFailure(denied)).toMatchObject({ code: "capability_denied" });
+        expect(yield* dispatched()).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect("approves when the environment allows it and records the MCP client", () =>
+    withApprovals(true, "full-access", (call, dispatched) =>
+      Effect.gen(function* () {
+        const result = yield* call({ action: "respond", requestId, decision: "accept" });
+        expect(declaredFailure(result)).toBeUndefined();
+        expect(yield* dispatched()).toMatchObject([
+          {
+            type: "runtime-request.respond",
+            requestId,
+            decision: "accept",
+            respondedBy: {
+              via: "mcp",
+              clientSessionId: "session-1",
+              clientLabel: "Claude Code",
+            },
+          },
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("a caller below full access can decline but not approve", () =>
+    withApprovals(true, "auto", (call, dispatched) =>
+      Effect.gen(function* () {
+        const approve = yield* call({ action: "respond", requestId, decision: "accept" });
+        expect(declaredFailure(approve)).toMatchObject({ code: "capability_denied" });
+        const decline = yield* call({ action: "respond", requestId, decision: "decline" });
+        expect(declaredFailure(decline)).toBeUndefined();
+        expect(yield* dispatched()).toMatchObject([{ decision: "decline" }]);
+      }),
+    ),
+  );
+
+  it.effect("rejects a decision the approval did not offer", () =>
+    withApprovals(true, "full-access", (call, dispatched) =>
+      Effect.gen(function* () {
+        const result = yield* call({ action: "respond", requestId, decision: "acceptForSession" });
+        expect(declaredFailure(result)).toMatchObject({ code: "invalid_request" });
+        expect(yield* dispatched()).toEqual([]);
+      }),
+    ),
+  );
+});

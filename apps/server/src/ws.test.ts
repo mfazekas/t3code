@@ -3,7 +3,9 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   AuthSessionId,
+  CommandId,
   EnvironmentId,
+  RuntimeRequestId,
   ProjectId,
   ThreadId,
   ProviderDriverKind,
@@ -11,6 +13,7 @@ import {
   WS_METHODS,
   WsServerRefreshProvidersRpc,
   WsSubscribeServerConfigRpc,
+  type OrchestrationV2RuntimeRequestResponder,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2ThreadShell,
   type OrchestrationProjectShell,
@@ -125,6 +128,7 @@ import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ProjectEnrichment from "./project/ProjectEnrichmentService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
 import {
+  clientResponder,
   layerWsRpc,
   resolveOpenDiscoveryForConfig,
   subscribeOrchestrationV2Shell,
@@ -1055,3 +1059,31 @@ it.effect("thread resume across compacted history keeps message order and final 
     ),
   ),
 );
+
+it("records the paired client that answers a request, whatever the client claims", () => {
+  const respond = clientResponder({
+    sessionId: AuthSessionId.make("session-browser"),
+    subject: "user",
+    method: "browser-session-cookie",
+    scopes: [],
+  });
+  const command = {
+    type: "runtime-request.respond" as const,
+    commandId: CommandId.make("respond"),
+    threadId: ThreadId.make("thread"),
+    requestId: RuntimeRequestId.make("request"),
+    decision: "accept" as const,
+    respondedBy: { via: "mcp", clientLabel: "forged" } as OrchestrationV2RuntimeRequestResponder,
+  };
+  assert.deepEqual(respond(command).respondedBy, {
+    via: "client",
+    authSessionId: AuthSessionId.make("session-browser"),
+    authMethod: "browser-session-cookie",
+  });
+  const other = {
+    type: "thread.pin" as const,
+    commandId: command.commandId,
+    threadId: command.threadId,
+  };
+  assert.strictEqual(respond(other), other);
+});

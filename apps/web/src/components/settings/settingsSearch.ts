@@ -608,6 +608,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     scope: "environment-defaults",
   },
   {
+    id: "mcp-approval-responses",
+    title: "Allow approvals over MCP",
+    to: "/settings/threads",
+    scope: "environment-defaults",
+    searchTerms: ["permission request approve decline agent voice mcp client remote"],
+  },
+  {
     id: "continue-threads-after-server-update",
     title: "Continue threads after restarts",
     to: "/settings/maintenance",

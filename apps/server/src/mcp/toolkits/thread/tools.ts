@@ -12,6 +12,9 @@ import {
   ProviderInteractionMode,
   RuntimeRequestId,
   ProviderUserInputAnswers,
+  ProviderApprovalDecision,
+  ProviderApprovalOption,
+  OrchestrationV2RuntimeRequest,
   IsoDateTime,
   OrchestratorMcpFailure,
   OrchestrationV2DispatchCommandResult,
@@ -28,6 +31,7 @@ import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 
 const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
   description:
@@ -124,20 +128,35 @@ const question = Schema.Struct({
   initialAnswer: Schema.optional(Schema.String),
   required: Schema.optional(Schema.Boolean),
 });
+const approvalKind = OrchestrationV2RuntimeRequest.fields.kind;
 const PendingRequestTool = Tool.make("t3_pending_request", {
   ...commandTool,
+  dependencies: [...commandTool.dependencies, ServerSettings.ServerSettingsService],
   description:
-    "Pending user questions in a thread. Omit `threadId` for this thread. list: their ids; approvals are not listed. read: one by `requestId`. respond: answer one with `answers`; this cannot approve a permission request.",
+    "Pending questions and approvals in a thread. Omit `threadId` for this thread. list: their ids. read: one by `requestId`. respond: `answers` for a question; `decision` for an approval, only if the user enabled it, and approving needs full access.",
   parameters: Schema.Struct({
     action: Schema.Literals(["list", "read", "respond"]),
     environmentId: OrchestratorMcpEnvironmentTarget,
     threadId: Schema.optional(ThreadId),
     requestId: Schema.optional(RuntimeRequestId),
     answers: Schema.optional(ProviderUserInputAnswers),
+    decision: Schema.optional(ProviderApprovalDecision),
   }),
   success: Schema.Union([
-    Schema.Struct({ requestIds: Schema.Array(RuntimeRequestId) }),
+    Schema.Struct({
+      requestIds: Schema.Array(RuntimeRequestId),
+      approvals: Schema.Array(Schema.Struct({ requestId: RuntimeRequestId, kind: approvalKind })),
+    }),
     Schema.Struct({ requestId: RuntimeRequestId, questions: Schema.Array(question) }),
+    Schema.Struct({
+      requestId: RuntimeRequestId,
+      kind: approvalKind,
+      prompt: Schema.optional(Schema.String),
+      promptTruncated: Schema.optional(Schema.Boolean),
+      reason: Schema.optional(Schema.String),
+      appName: Schema.optional(Schema.String),
+      options: Schema.optional(Schema.Array(ProviderApprovalOption)),
+    }),
     OrchestrationV2DispatchCommandResult,
   ]),
 })
