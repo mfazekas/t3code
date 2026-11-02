@@ -1595,6 +1595,39 @@ export function ThreadsSettingsPanel() {
         </SettingsSection>
       ) : null}
 
+      <SettingsSection id="approvals" title="Approvals">
+        <SettingsRow
+          serverScoped
+          settingKeys={["allowMcpApprovalResponses"]}
+          {...searchableSetting("mcp-approval-responses")}
+          description="Let agents connected over MCP answer permission requests. They can decline, but approving asks you to confirm in your MCP app, so only you can approve."
+          resetAction={
+            settings.allowMcpApprovalResponses !==
+            DEFAULT_UNIFIED_SETTINGS.allowMcpApprovalResponses ? (
+              <SettingResetButton
+                label="MCP approval responses"
+                onClick={() =>
+                  updateSettings({
+                    allowMcpApprovalResponses: DEFAULT_UNIFIED_SETTINGS.allowMcpApprovalResponses,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <ScopedSwitch
+              settingKeys={["allowMcpApprovalResponses"]}
+              checked={settings.allowMcpApprovalResponses}
+              disabled={!hasServerTargets}
+              onCheckedChange={(checked) =>
+                updateSettings({ allowMcpApprovalResponses: Boolean(checked) })
+              }
+              aria-label="Allow approvals over MCP"
+            />
+          }
+        />
+      </SettingsSection>
+
       <SettingsSection id="usage-limits" title="Usage limits">
         <SettingsRow
           serverScoped

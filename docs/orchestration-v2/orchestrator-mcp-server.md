@@ -278,6 +278,16 @@ it grants no approval authority. Read the fresh full request in the child thread
 responding, since the durable record can outlive its provider callback. Async questions
 do not end the wait.
 
+`t3_pending_request` lists and reads approvals as well as questions. Answering one
+with `decision` works only when the environment's `allowMcpApprovalResponses`
+setting is on (off by default; Settings → Threads → Approvals). The agent can decline
+or cancel, but not approve on its own: an approval goes to the user as an MCP
+elicitation form in their client, and only their confirmation resolves it. A client
+without elicitation support can't approve. Each resolved request records its responder
+in `respondedBy`: `via: "mcp"` with the calling thread or client (and
+`confirmedBy: "elicitation"` when the user confirmed), or `via: "client"` with the paired
+session that answered.
+
 ```ts
 type DelegateTaskResult = {
   taskId: string;
@@ -492,7 +502,7 @@ a notification message telling it to answer with the pending request tools or
 ask the user. The message says whether the child is blocked or, for a Codex
 async question, still working. If the question is answered or dismissed before
 the notification starts a turn, that queued turn is cancelled. Approvals are not
-routed, because those tools cannot answer them.
+routed to the parent.
 A parent still blocked in a `delegate_task` wait gets the blocking question
 through that wait instead.
 If the provider cuts that wait short, a still-pending live question wakes the
