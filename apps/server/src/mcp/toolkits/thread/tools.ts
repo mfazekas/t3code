@@ -25,7 +25,7 @@ import {
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Schema from "effect/Schema";
-import { Tool, Toolkit } from "effect/ai";
+import { McpSchema, Tool, Toolkit } from "effect/ai";
 
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTaskService from "../../../scheduledTasks/ScheduledTaskService.ts";
@@ -131,9 +131,13 @@ const question = Schema.Struct({
 const approvalKind = OrchestrationV2RuntimeRequest.fields.kind;
 const PendingRequestTool = Tool.make("t3_pending_request", {
   ...commandTool,
-  dependencies: [...commandTool.dependencies, ServerSettings.ServerSettingsService],
+  dependencies: [
+    ...commandTool.dependencies,
+    ServerSettings.ServerSettingsService,
+    McpSchema.McpServerClient,
+  ],
   description:
-    "Pending questions and approvals in a thread. Omit `threadId` for this thread. list: their ids. read: one by `requestId`. respond: `answers` for a question; `decision` for an approval, only if the user enabled it, and approving needs full access.",
+    "Pending questions and approvals in a thread. Omit `threadId` for this thread. list: their ids. read: one by `requestId`. respond: `answers` for a question; `decision` for an approval, if the user enabled it. Approving asks the user to confirm.",
   parameters: Schema.Struct({
     action: Schema.Literals(["list", "read", "respond"]),
     environmentId: OrchestratorMcpEnvironmentTarget,

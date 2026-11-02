@@ -1121,9 +1121,32 @@ describe("approvals over MCP", () => {
     ],
   };
 
+  const elicitingClient = (answer: { readonly approve: boolean } | "decline") => {
+    const asked: Array<string> = [];
+    return {
+      asked,
+      client: McpSchema.McpServerClient.of({
+        ...client,
+        clientCapabilities: { elicitation: { form: {} } },
+        getClient: Effect.succeed({
+          listRoots: () => Effect.die("unused"),
+          createMessage: () => Effect.die("unused"),
+          elicit: (request) => {
+            asked.push(request.message);
+            return Effect.succeed(
+              answer === "decline"
+                ? { action: "decline" as const }
+                : { action: "accept" as const, content: answer },
+            );
+          },
+        }),
+      }),
+    };
+  };
+
   const withApprovals = (
     allowMcpApprovalResponses: boolean,
-    access: McpInvocationContext.McpClientCaller["access"],
+    mcpClient: McpSchema.McpServerClient["Service"],
     test: (
       call: (
         args: Record<string, unknown>,
@@ -1165,17 +1188,18 @@ describe("approvals over MCP", () => {
               .pipe(
                 Effect.provideService(
                   McpInvocationContext.McpInvocationContext,
-                  clientScope(access),
+                  clientScope("auto"),
                 ),
-                Effect.provideService(McpSchema.McpServerClient, client),
+                Effect.provideService(McpSchema.McpServerClient, mcpClient),
               ),
           () => Ref.get(commands),
         );
       }).pipe(Effect.provide(layer));
     });
 
-  it.effect("lists and reads an approval even while responding is off", () =>
-    withApprovals(false, "full-access", (call, dispatched) =>
+  it.effect("lists and reads an approval even while responding is off", () => {
+    const confirming = elicitingClient({ approve: true });
+    return withApprovals(false, confirming.client, (call, dispatched) =>
       Effect.gen(function* () {
         expect((yield* call({ action: "list" })).structuredContent).toEqual({
           requestIds: [],
@@ -1189,16 +1213,20 @@ describe("approvals over MCP", () => {
         });
         const denied = yield* call({ action: "respond", requestId, decision: "accept" });
         expect(declaredFailure(denied)).toMatchObject({ code: "capability_denied" });
+        expect(confirming.asked).toEqual([]);
         expect(yield* dispatched()).toEqual([]);
       }),
-    ),
-  );
+    );
+  });
 
-  it.effect("approves when the environment allows it and records the MCP client", () =>
-    withApprovals(true, "full-access", (call, dispatched) =>
+  it.effect("approves only after the user confirms in their MCP client", () => {
+    const confirming = elicitingClient({ approve: true });
+    return withApprovals(true, confirming.client, (call, dispatched) =>
       Effect.gen(function* () {
         const result = yield* call({ action: "respond", requestId, decision: "accept" });
         expect(declaredFailure(result)).toBeUndefined();
+        expect(confirming.asked).toHaveLength(1);
+        expect(confirming.asked[0]).toContain("rm -r build");
         expect(yield* dispatched()).toMatchObject([
           {
             type: "runtime-request.respond",
@@ -1208,32 +1236,51 @@ describe("approvals over MCP", () => {
               via: "mcp",
               clientSessionId: "session-1",
               clientLabel: "Claude Code",
+              confirmedBy: "elicitation",
             },
           },
         ]);
       }),
-    ),
-  );
+    );
+  });
 
-  it.effect("a caller below full access can decline but not approve", () =>
-    withApprovals(true, "auto", (call, dispatched) =>
+  it.effect.each([
+    { scenario: "leaves the box unchecked", answer: { approve: false } },
+    { scenario: "declines the form", answer: "decline" as const },
+  ])("keeps the approval pending when the user $scenario", ({ answer }) => {
+    const confirming = elicitingClient(answer);
+    return withApprovals(true, confirming.client, (call, dispatched) =>
+      Effect.gen(function* () {
+        const result = yield* call({ action: "respond", requestId, decision: "accept" });
+        expect(declaredFailure(result)).toMatchObject({ code: "invalid_request" });
+        expect(yield* dispatched()).toEqual([]);
+      }),
+    );
+  });
+
+  it.effect("a client that cannot ask the user can decline but not approve", () =>
+    withApprovals(true, client, (call, dispatched) =>
       Effect.gen(function* () {
         const approve = yield* call({ action: "respond", requestId, decision: "accept" });
         expect(declaredFailure(approve)).toMatchObject({ code: "capability_denied" });
         const decline = yield* call({ action: "respond", requestId, decision: "decline" });
         expect(declaredFailure(decline)).toBeUndefined();
-        expect(yield* dispatched()).toMatchObject([{ decision: "decline" }]);
+        expect(yield* dispatched()).toMatchObject([
+          { decision: "decline", respondedBy: { via: "mcp" } },
+        ]);
       }),
     ),
   );
 
-  it.effect("rejects a decision the approval did not offer", () =>
-    withApprovals(true, "full-access", (call, dispatched) =>
+  it.effect("rejects a decision the approval did not offer", () => {
+    const confirming = elicitingClient({ approve: true });
+    return withApprovals(true, confirming.client, (call, dispatched) =>
       Effect.gen(function* () {
         const result = yield* call({ action: "respond", requestId, decision: "acceptForSession" });
         expect(declaredFailure(result)).toMatchObject({ code: "invalid_request" });
+        expect(confirming.asked).toEqual([]);
         expect(yield* dispatched()).toEqual([]);
       }),
-    ),
-  );
+    );
+  });
 });

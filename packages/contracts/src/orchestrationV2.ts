@@ -1216,6 +1216,8 @@ export const OrchestrationV2RuntimeRequestResponder = Schema.Union([
     callerThreadId: Schema.optional(ThreadId),
     clientSessionId: Schema.optional(Schema.String),
     clientLabel: Schema.optional(Schema.String),
+    /** The user approved in a form their MCP client showed them, not through the agent. */
+    confirmedBy: Schema.optional(Schema.Literal("elicitation")),
   }),
 ]);
 export type OrchestrationV2RuntimeRequestResponder =

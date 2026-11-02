@@ -12,14 +12,13 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { McpSchema } from "effect/ai";
 import { modelSelectionCommandType } from "@t3tools/shared/model";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import {
-  assertFullAccess,
   dispatchFailure,
-  loadCaller,
   newCommandId,
   readCaller,
   readThread,
@@ -117,10 +116,73 @@ const mcpResponder = Effect.fn("mcp.responder")(function* () {
   } satisfies OrchestrationV2RuntimeRequestResponder;
 });
 
-/** Answering an approval is opt-in per environment; approving also needs a full-access caller. */
+const APPROVAL_CONFIRM_PROMPT_LIMIT = 500;
+const decodeApprovalForm = Schema.decodeUnknownEffect(McpSchema.ElicitRequestFormParams);
+
+/**
+ * The agent can decline, but an approval needs the user's own answer: the MCP client shows the
+ * request as an elicitation form, which the model cannot fill in.
+ */
+const confirmApprovalWithUser = Effect.fn("mcp.confirmApprovalWithUser")(function* (
+  item: { readonly prompt?: string | undefined; readonly reason?: string | undefined },
+  threadTitle: string,
+) {
+  const client = yield* McpSchema.McpServerClient;
+  if (client.clientCapabilities.elicitation === undefined)
+    return yield* new OrchestratorMcpFailure({
+      code: "capability_denied",
+      message: `${client.clientInfo.name} cannot show the user a confirmation form, so it cannot approve. Ask the user to approve in T3 Code.`,
+    });
+  const prompt = Array.from(item.prompt ?? "");
+  const message = [
+    `Approve this request in "${threadTitle}"?`,
+    prompt.length === 0
+      ? undefined
+      : prompt.slice(0, APPROVAL_CONFIRM_PROMPT_LIMIT).join("") +
+        (prompt.length > APPROVAL_CONFIRM_PROMPT_LIMIT ? "…" : ""),
+    item.reason === undefined ? undefined : `Why it asks: ${item.reason}`,
+  ]
+    .filter((line) => line !== undefined)
+    .join("\n\n");
+  const request = yield* decodeApprovalForm({
+    mode: "form",
+    message,
+    requestedSchema: {
+      type: "object",
+      properties: {
+        approve: {
+          type: "boolean",
+          title: "Approve",
+          description: "Check to approve. Your answer goes to T3 Code, not to the agent.",
+        },
+      },
+      required: ["approve"],
+    },
+  }).pipe(Effect.orDie);
+  const answer = yield* client.getClient.pipe(
+    Effect.flatMap((reverse) => reverse.elicit(request)),
+    Effect.scoped,
+    Effect.catchTags({
+      McpReverseOperationError: () => Effect.void,
+      McpReverseOperationUnsupported: () => Effect.void,
+    }),
+  );
+  if (answer?.action !== "accept" || answer.content?.approve !== true)
+    return yield* new OrchestratorMcpFailure({
+      code: "invalid_request",
+      message: "The user did not approve. The request is still pending.",
+    });
+});
+
+/** Answering an approval is opt-in per environment; approving also needs the user's own answer. */
 const approvalDecision = Effect.fn("mcp.approvalDecision")(function* (
   decision: ProviderApprovalDecision | undefined,
-  offered: ReadonlyArray<ProviderApprovalDecision> | undefined,
+  item: {
+    readonly prompt?: string | undefined;
+    readonly reason?: string | undefined;
+    readonly options?: ReadonlyArray<{ readonly decision: ProviderApprovalDecision }> | undefined;
+  },
+  threadTitle: string,
 ) {
   const settings = yield* ServerSettings.ServerSettingsService.pipe(
     Effect.flatMap((service) => service.getSettings),
@@ -137,18 +199,17 @@ const approvalDecision = Effect.fn("mcp.approvalDecision")(function* (
       code: "invalid_request",
       message: "An approval needs a `decision`.",
     });
+  const offered = item.options?.map((option) => option.decision);
   if (!(offered ?? DEFAULT_APPROVAL_DECISIONS).includes(decision))
     return yield* new OrchestratorMcpFailure({
       code: "invalid_request",
       message: "That decision was not offered for this approval.",
     });
-  if (decision !== "decline" && decision !== "cancel")
-    yield* assertFullAccess(
-      yield* loadCaller(),
-      "Approving needs a live full-access thread or a full-access client.",
-    );
-  return decision;
+  const approving = decision !== "decline" && decision !== "cancel";
+  if (approving) yield* confirmApprovalWithUser(item, threadTitle);
+  return { decision, userConfirmed: approving };
 });
+
 /** A field the chosen action needs. `null` counts as given, as in `beforeRunId: null`. */
 const required = <A>(value: A | undefined, name: string) =>
   value === undefined
@@ -345,17 +406,23 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           threadId: input.threadId,
           requestId,
         });
-        const response =
-          request.kind === "user_input"
-            ? { answers: yield* required(input.answers, "answers") }
-            : {
-                decision: yield* approvalDecision(
-                  input.decision,
-                  item?.type === "approval_request"
-                    ? item.options?.map((option) => option.decision)
-                    : undefined,
-                ),
-              };
+        const responder = yield* mcpResponder();
+        let response;
+        if (request.kind === "user_input") {
+          response = { answers: yield* required(input.answers, "answers"), respondedBy: responder };
+        } else {
+          const { decision, userConfirmed } = yield* approvalDecision(
+            input.decision,
+            item?.type === "approval_request" ? item : {},
+            projection.thread.title,
+          );
+          response = {
+            decision,
+            respondedBy: userConfirmed
+              ? { ...responder, confirmedBy: "elicitation" as const }
+              : responder,
+          };
+        }
         const result = yield* threads
           .dispatch({
             type: "runtime-request.respond",
@@ -363,7 +430,6 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
             commandId: yield* newCommandId(),
             requestId,
             ...response,
-            respondedBy: yield* mcpResponder(),
           })
           .pipe(Effect.mapError(dispatchFailure));
         return { sequence: result.sequence };

@@ -1235,7 +1235,7 @@ export const ServerSettings = Schema.Struct({
   projectSettingsFolded: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 
   enableAgentDeviceAccess: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
-  /** Lets MCP callers answer permission requests; approving also needs a full-access caller. */
+  /** Lets MCP callers answer permission requests; approving also needs the user's confirmation in their MCP client. */
   allowMcpApprovalResponses: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   /** Enabling the Device panel must not grant providers device control. */
   enableDeviceSupport: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),

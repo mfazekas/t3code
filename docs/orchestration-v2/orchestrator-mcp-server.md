@@ -280,10 +280,13 @@ do not end the wait.
 
 `t3_pending_request` lists and reads approvals as well as questions. Answering one
 with `decision` works only when the environment's `allowMcpApprovalResponses`
-setting is on (off by default; Settings → Threads → Approvals). Approving also needs a
-live full-access thread or a full-access client; declining or cancelling does not. Each
-resolved request records its responder in `respondedBy`: `via: "mcp"` with the calling
-thread or client, or `via: "client"` with the paired session that answered.
+setting is on (off by default; Settings → Threads → Approvals). The agent can decline
+or cancel, but not approve on its own: an approval goes to the user as an MCP
+elicitation form in their client, and only their confirmation resolves it. A client
+without elicitation support can't approve. Each resolved request records its responder
+in `respondedBy`: `via: "mcp"` with the calling thread or client (and
+`confirmedBy: "elicitation"` when the user confirmed), or `via: "client"` with the paired
+session that answered.
 
 ```ts
 type DelegateTaskResult = {

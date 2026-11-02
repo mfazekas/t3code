@@ -1600,7 +1600,7 @@ export function ThreadsSettingsPanel() {
           serverScoped
           settingKeys={["allowMcpApprovalResponses"]}
           {...searchableSetting("mcp-approval-responses")}
-          description="Let agents and apps connected over MCP answer permission requests. Approving also needs a full-access connection. Each answer records who gave it."
+          description="Let agents connected over MCP answer permission requests. They can decline, but approving asks you to confirm in your MCP app, so only you can approve."
           resetAction={
             settings.allowMcpApprovalResponses !==
             DEFAULT_UNIFIED_SETTINGS.allowMcpApprovalResponses ? (
